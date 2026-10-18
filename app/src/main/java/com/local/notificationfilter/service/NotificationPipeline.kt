@@ -344,14 +344,18 @@ class NotificationPipeline(
         // 百度网盘的传输 / 备份类通知复用同一个 key 反复重发，进度只体现在 EXTRA_PROGRESS
         // （或 RemoteViews 里的进度条）上，title / text / textLines 完全不变 → 修复前从第二条起
         // 全部被下面这行 `return@withLock` 静默丢弃。
-        // 把 subText / summaryText / 进度拼成附加签名后，这类更新会被识别为「内容变了」。
-        // **去重语义不变**：仍然是「与上一次完全相同才跳过」，只是「哪些算相同」更准了。
+        //
+        // —— V11.4 再修：签名从「只有 progress」扩到**全部 extras** ——
+        // 用户反馈「通知没从通知栏清掉、字段内容确实在变，但列表/规则一直拿不到新值」。
+        // 病根：只签 progress 时，任何**其它** extras 字段变化都不改变指纹 → 被当成「内容未变」
+        // 丢弃，既不刷新流水也不跑规则（连详情页的 extras 都是旧的）。现在任何一个字段变化
+        // 都算「内容变了」；频率由下面的 1.2 秒节流兜住，不会刷屏。
         val extraSignature = buildString {
             append(snapshot.subText.orEmpty())
             append(SIGNATURE_SEPARATOR)
             append(snapshot.summaryText.orEmpty())
             append(SIGNATURE_SEPARATOR)
-            append(progressSignature(snapshot.extras))
+            append(extrasSignature(snapshot.extras))
         }
         val fingerprint = NotificationFingerprint.of(
             title = snapshot.title,
@@ -366,14 +370,25 @@ class NotificationPipeline(
         recentFingerprints[snapshot.key] = fingerprint
 
         // —— V10.7 耗电修复：高频更新的「同 key 时间窗节流」——
-        // 指纹里含 subText / summaryText / android.progress（V10.2 为修百度网盘加的），
-        // 副作用是音乐/下载通知每秒改进度 → 每秒都被判为"新内容"→ 去重失效 → 每秒全链路。
-        // 这里加一层时间窗：同 key 在 [MIN_HANDLE_INTERVAL_MS] 内只处理一次，
-        // 进度更新被合并到下一个窗口；"进度能进流水"保留，但不会每秒刷。
+        // 指纹口径（V11.4 起）含 subText / summaryText / **全部 extras**，
+        // 于是音乐、下载、导航这类每秒刷新的通知每次都算「内容变了」，
+        // 若不加限制就是每秒跑一遍完整链路（规则匹配 + 动作 + 若干次 SQL）。
+        // 这里加一层时间窗：同 key 在 [MIN_HANDLE_INTERVAL_MS] 内只跑一次完整链路。
         val lastHandled = recentHandledAt[snapshot.key]
         if (lastHandled != null && now - lastHandled < MIN_HANDLE_INTERVAL_MS) {
-            NfLog.d(this, "同 key 高频更新，节流跳过 key=${snapshot.key} pkg=$packageName")
-            return@withLock
+            // —— V11.4：节流只压「跑规则 + 执行动作」，**绝不能把内容更新也丢掉** ——
+            // 旧实现这里直接 return。后果：如果一条通知只更新一次（例如取件通知从
+            // 「待取件」变成「已签收」），而这次更新正好落在上一次处理的 1.2 秒窗口内，
+            // 它就永久消失了 —— 流水与详情页一直显示旧内容，用户看到的就是
+            // 「通知还在、字段明明变了、但一直获取不到新内容」。
+            // 现在改为就地刷新该行内容：不跑规则、不计统计、不触发「出现」边沿，
+            // 动作频率仍被 1.2 秒窗口限制，刷屏问题不受影响。
+            if (refreshLiveRecordContent(snapshot, appName, now)) {
+                NfLog.d(this, "同 key 高频更新：仅刷新内容不跑规则 key=${snapshot.key} pkg=$packageName")
+                return@withLock
+            }
+            // 没有可刷新的「活行」（典型：刚被 onRemoved 摘掉又立刻重投，或超出合并窗口）：
+            // 不能吞掉这条通知，继续走完整链路去补一行。
         }
         recentHandledAt[snapshot.key] = now
 
@@ -658,6 +673,31 @@ class NotificationPipeline(
     private class RecordSlot(val recordId: Long, val coalesced: Boolean)
 
     /**
+     * V11.4：**只刷新流水内容列**（不跑规则 / 不计统计 / 不触发「出现」边沿）。
+     *
+     * 使用场景：同一 key 的高频更新被 [MIN_HANDLE_INTERVAL_MS] 节流时。
+     * 指纹已经判定「内容确实变了」，但为了不刷屏、不狂跑动作，只把最新的
+     * 文本 / extras 写回那一行；`result` / `executedActions` / `ruleName` 故意不动——
+     * 它们描述的是「这条通知被怎么处理」，不该因为内容刷新而丢失。
+     *
+     * @return true = 已就地刷新；false = 没有可刷新的活行（调用方必须继续走完整链路，
+     *   否则「刚被 onRemoved 摘掉又立刻重投」的通知会被静默吞掉）
+     */
+    private suspend fun refreshLiveRecordContent(
+        snapshot: NotificationSnapshot,
+        appName: String,
+        now: Long,
+    ): Boolean {
+        val live = liveRecords[snapshot.key] ?: return false
+        // 超出合并窗口（10 分钟）说明这已经是「另一条通知」了，交给正常链路插新行，
+        // 这里不能硬改旧行（否则会把十分钟前的记录改成本条内容）。
+        if (!RecordCoalescer.shouldCoalesce(live.lastWriteAt, now)) return false
+        container.recordRepository.updateSnapshot(live.recordId, snapshot, appName, now)
+        live.lastWriteAt = now
+        return true
+    }
+
+    /**
      * 插一条流水（`result = PASS` 占位，判定后由 [persistEvaluation] 改写）。
      *
      * 抽出来是为了让补处理在「这条通知在服务断开期间漏记」时也能补一条，
@@ -842,6 +882,35 @@ internal fun progressSignature(extras: List<Pair<String, String>>): String {
     if (progress.isEmpty() && progressMax.isEmpty()) return ""
     return "$progress/$progressMax"
 }
+
+/**
+ * V11.4：**全部 extras** 的稳定签名（用于内容指纹）。
+ *
+ * 为什么必须覆盖全部：V10.2 只签了 `android.progress / progressMax`，于是任何**其它**
+ * extras 字段变化（自定义键、厂商字段、媒体字段…）都不会改变指纹，通知会被去重逻辑
+ * 当成「内容未变」整条丢弃 —— 流水、详情页、规则都拿不到新值。用户报的
+ * 「通知还在、字段在变、但一直获取不到新内容」就是这个。
+ *
+ * 稳定性处理：`FieldExtractor.dumpExtras` 把 ByteArray 字符串化成
+ * `[B@<identityHash> (byte[N])`，identityHash 每次重投都不同；若原样纳入指纹，
+ * 指纹永远不相等 → 去重完全失效、每秒跑全链路。这里把它替换成只含长度的稳定形式。
+ * （只影响指纹，不影响流水里展示的原值。）
+ *
+ * 键顺序：`dumpExtras` 已按 key 排序，故同一内容的签名逐字节稳定。
+ *
+ * @param extras 快照的 extras dump（`key to stringifiedValue` 有序列表）
+ * @return 用 `\u0000` 连接的 `key=value` 串；无 extras 时为空串
+ */
+internal fun extrasSignature(extras: List<Pair<String, String>>): String =
+    extras.joinToString(SIGNATURE_SEPARATOR.toString()) { (key, value) ->
+        key + "=" + stableExtraValue(value)
+    }
+
+/** `[B@1a2b3c (byte[1024])` → `[byte[1024]]`；其它值原样返回。 */
+private val BYTE_ARRAY_SIGNATURE = Regex("^\\[B@[0-9A-Fa-f]+ \\(byte\\[(\\d+)]\\)$")
+
+private fun stableExtraValue(value: String): String =
+    BYTE_ARRAY_SIGNATURE.matchEntire(value)?.let { "[byte[" + it.groupValues[1] + "]]" } ?: value
 
 /**
  * V10.7 耗电修复：同一 key 的最短处理间隔（ms）。

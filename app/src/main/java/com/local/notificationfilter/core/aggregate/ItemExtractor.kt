@@ -3,6 +3,7 @@ package com.local.notificationfilter.core.aggregate
 import com.local.notificationfilter.core.model.EscapeCodec
 import com.local.notificationfilter.core.model.ExtractorConfig
 import com.local.notificationfilter.core.model.NotificationSnapshot
+import com.local.notificationfilter.core.ruleengine.RegexCompat
 import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -64,11 +65,12 @@ object ItemExtractor {
      * 正则编译成本远高于匹配本身（音乐/下载类通知每秒刷新时就是纯浪费）。
      * 按 `(pattern, ignoreCase)` 缓存，容量有上界防泄漏；`accessOrder = true` 做 LRU。
      */
-    private val regexCache = object : LinkedHashMap<String, Regex>(64, 0.75f, true) {
-        override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<String, Regex>?,
-        ): Boolean = size > REGEX_CACHE_CAPACITY
-    }
+    private val regexCache =
+        object : LinkedHashMap<String, RegexCompat.Compiled>(64, 0.75f, true) {
+            override fun removeEldestEntry(
+                eldest: MutableMap.MutableEntry<String, RegexCompat.Compiled>?,
+            ): Boolean = size > REGEX_CACHE_CAPACITY
+        }
 
     /** 自进程启动以来，输入文本被 [MAX_INPUT_CHARS] 截断的次数。 */
     val truncatedInputCount: Long get() = truncatedCounter.get()
@@ -88,7 +90,9 @@ object ItemExtractor {
      */
     fun extractAll(snapshot: NotificationSnapshot, cfg: ExtractorConfig): List<String> {
         if (!cfg.isActive) return emptyList()
-        val regex = compileOrNull(cfg.pattern, cfg.ignoreCase) ?: return emptyList()
+        // V11.4：compileOrNull 返回兼容层结果（可能已把无上限后行断言改写成 (?:…)）
+        val compiled = compileOrNull(cfg.pattern, cfg.ignoreCase) ?: return emptyList()
+        val regex = compiled.regex
         if (cfg.limit <= 0) return emptyList()
 
         val input = inputText(snapshot, cfg)
@@ -161,14 +165,19 @@ object ItemExtractor {
      * 会把一条通知抽出成百上千个空串（虽然后续 trim 后会被丢弃，但白烧 CPU）。
      *
      * 命中 [regexCache] 时零编译成本；缓存未命中才真正编译一次。
+     *
+     * V11.4：编译统一走 [RegexCompat]。Android(ICU) 不允许后行断言里出现 `*` `+` `{n,}`，
+     * 用户写 `(?<=取件码[：:]?\s*)\d{6}` 在电脑上能跑、到手机上编译失败，
+     * 表现就是「正向/负向断言不生效」。兼容层会把它等价改写成 `(?:取件码[：:]?\s*)\d{6}`。
+     *
+     * @return 编译结果（含「是否发生兼容改写」标记）；不可编译为 null
      */
     @Synchronized
-    private fun compileOrNull(pattern: String, ignoreCase: Boolean): Regex? {
+    private fun compileOrNull(pattern: String, ignoreCase: Boolean): RegexCompat.Compiled? {
         if (pattern.isBlank()) return null
         val key = (if (ignoreCase) "i\u0000" else "s\u0000") + pattern
         regexCache[key]?.let { return it }
-        val options = if (ignoreCase) setOf(RegexOption.IGNORE_CASE) else emptySet()
-        val compiled = runCatching { Regex(pattern, options) }.getOrNull() ?: return null
+        val compiled = RegexCompat.compileOrNull(pattern, ignoreCase) ?: return null
         regexCache[key] = compiled
         return compiled
     }

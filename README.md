@@ -4,9 +4,9 @@
 并可以把通知渲染成屏幕上的弹幕或悬浮卡片。
 
 > 小米 15 · 澎湃 OS3（Android 15）上开发与验证 · 侧载 APK · **纯本地运行、不联网、无账号**
-> 当前版本：**11.3**（`versionCode 13`）｜ `minSdk 26` / `compileSdk 34`
+> 当前版本：**11.4**（`versionCode 14`）｜ `minSdk 26` / `compileSdk 34`
 
-**📥 下载安装包**：[Releases](https://github.com/zmn001125/notification-filter/releases) → 下载 `notification-filter-v11.3-release.apk` 传到手机点击安装。
+**📥 下载安装包**：[Releases](https://github.com/zmn001125/notification-filter/releases) → 下载 `notification-filter-v11.4-release.apk` 传到手机点击安装。
 （也可以按下面的「构建」一节自己编译。）
 
 ---

@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.local.notificationfilter.NfApplication
 import com.local.notificationfilter.core.aggregate.AggregationRenderer
 import com.local.notificationfilter.core.aggregate.ItemExtractor
+import com.local.notificationfilter.core.ruleengine.RegexCompat
 import com.local.notificationfilter.core.model.AggregationConfig
 import com.local.notificationfilter.core.model.AggregationItem
 import com.local.notificationfilter.core.model.AggregationOutput
@@ -97,8 +98,11 @@ data class ExtractorForm(
     /** 正则是否非法（非空且编译失败）；合法 / 空白返回 null。实时校验用。 */
     val patternError: String? get() = when {
         pattern.isBlank() -> null
-        // 与提取器实现同一口径（`ItemExtractor.isPatternValid` 是唯一判定源）
-        !ItemExtractor.isPatternValid(pattern, ignoreCase) -> REGEX_ERROR
+        // 与提取器同一编译口径（都走 RegexCompat）；失败时给出**具体原因**，
+        // 而不是一句「正则语法有误」——Android(ICU) 的坑（后行断言里用 * + {n,}、
+        // 全角符号、\g{n} 等）用户根本猜不到。
+        RegexCompat.compileOrNull(pattern, ignoreCase) == null ->
+            RegexCompat.explain(pattern) ?: REGEX_ERROR
         else -> null
     }
 
@@ -906,9 +910,12 @@ class RuleEditViewModel(application: Application) : AndroidViewModel(application
 
             MatchMode.REGEX -> {
                 if (s.regexPattern.isBlank()) return null to "请填写正则表达式"
-                // runCatching 兜底 PatternSyntaxException
-                if (runCatching { Regex(s.regexPattern) }.isFailure) {
-                    return null to "正则表达式有误，请检查语法"
+                // V11.4：走 RegexCompat（含 Android ICU 的后行断言兼容改写），
+                // 失败时把具体原因说清楚，别只丢一句「语法有误」。
+                if (RegexCompat.compileOrNull(s.regexPattern, s.regexIgnoreCase) == null) {
+                    return null to (
+                        RegexCompat.explain(s.regexPattern) ?: "正则表达式有误，请检查语法"
+                        )
                 }
             }
         }

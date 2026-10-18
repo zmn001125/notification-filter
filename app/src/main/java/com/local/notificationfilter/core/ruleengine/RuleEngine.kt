@@ -35,20 +35,21 @@ object RuleEngine {
      *
      * 原来每条通知、每个正则规则都 `Regex(pattern)` 重新编译一次——编译成本远高于匹配本身，
      * 对每秒刷新的音乐/下载通知就是纯浪费。按 `(pattern, ignoreCase)` 缓存，容量有上界防泄漏。
+     *
+     * V11.4：编译统一走 [RegexCompat]（Android ICU 不允许后行断言里有无上限量词，
+     * 失败时按 `(?:…)` 等价改写并标记），缓存里存改写后的结果，避免每次都重试两遍。
      */
-    private val regexCache = object : LinkedHashMap<String, Regex>(64, 0.75f, true) {
+    private val regexCache = object : LinkedHashMap<String, RegexCompat.Compiled>(64, 0.75f, true) {
         override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<String, Regex>?,
+            eldest: MutableMap.MutableEntry<String, RegexCompat.Compiled>?,
         ): Boolean = size > 128
     }
 
     @Synchronized
-    private fun cachedRegex(pattern: String, ignoreCase: Boolean): Regex? {
+    private fun cachedRegex(pattern: String, ignoreCase: Boolean): RegexCompat.Compiled? {
         val key = (if (ignoreCase) "i\u0000" else "s\u0000") + pattern
         regexCache[key]?.let { return it }
-        val compiled = runCatching {
-            Regex(pattern, if (ignoreCase) setOf(RegexOption.IGNORE_CASE) else emptySet())
-        }.getOrNull() ?: return null
+        val compiled = RegexCompat.compileOrNull(pattern, ignoreCase) ?: return null
         regexCache[key] = compiled
         return compiled
     }
@@ -258,17 +259,23 @@ object RuleEngine {
     ): MatchResult {
         val cfg: RegexConfig = rule.regex ?: return base.copy(reason = "未配置正则表达式")
         if (cfg.pattern.isBlank()) return base.copy(reason = "正则表达式为空")
-        val regex = cachedRegex(cfg.pattern, cfg.ignoreCase)
-            ?: return base.copy(reason = "正则表达式有误：${cfg.pattern}")
+        val compiled = cachedRegex(cfg.pattern, cfg.ignoreCase)
+            ?: return base.copy(
+                reason = RegexCompat.explain(cfg.pattern)
+                    ?: "正则表达式有误：${cfg.pattern}",
+            )
+        val regex = compiled.regex
 
         val hitFields = refs.filter { ref ->
             val text = snapshot.fieldText(ref)
             text.isNotEmpty() && regex.containsMatchIn(text)
         }
+        // 走了兼容改写要在原因里说清楚：用户看到"能命中"但 `$0` 里多了前缀时不会困惑
+        val rewriteNote = if (compiled.rewritten) "（后行断言已按 (?:…) 兼容改写）" else ""
         return if (hitFields.isNotEmpty()) {
-            hit(rule, base, hitFields.toSet(), "命中字段：${label(hitFields)}")
+            hit(rule, base, hitFields.toSet(), "命中字段：${label(hitFields)}$rewriteNote")
         } else {
-            base.copy(reason = "正则未命中任何被选字段：/${cfg.pattern}/")
+            base.copy(reason = "正则未命中任何被选字段：/${cfg.pattern}/$rewriteNote")
         }
     }
 
