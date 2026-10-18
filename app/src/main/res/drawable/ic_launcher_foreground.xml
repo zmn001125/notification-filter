@@ -1,0 +1,24 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 铃铛主体 -->
+    <path
+        android:fillColor="#37474F"
+        android:pathData="M54,22 C43,22 34,31 34,42 L34,62 L27,70 L81,70 L74,62 L74,42 C74,31 65,22 54,22 Z" />
+    <!-- 铃舌 -->
+    <path
+        android:fillColor="#37474F"
+        android:pathData="M47,74 m-7,0 a7,7 0 1,0 14,0 a7,7 0 1,0 -14,0" />
+    <!-- 右侧三条内容线：寓意“通知被整理/过滤” -->
+    <path
+        android:fillColor="#37474F"
+        android:pathData="M78,38 h12 v4 h-12 z" />
+    <path
+        android:fillColor="#37474F"
+        android:pathData="M78,48 h12 v4 h-12 z" />
+    <path
+        android:fillColor="#37474F"
+        android:pathData="M78,58 h12 v4 h-12 z" />
+</vector>

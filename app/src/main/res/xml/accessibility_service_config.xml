@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  V7 需求 7-⑥「打开了某个 App」的无障碍服务配置（架构 §3.6.2）。
+
+  隐私最小化声明（主理人硬性要求，勿放宽）：
+  - canRetrieveWindowContent="false"：本服务**不读取界面内容**（不抓窗口树），
+    只需要窗口状态变化事件里携带的包名。
+  - accessibilityEventTypes：只订阅「窗口状态变化」与「窗口变化」两类事件，
+    绝不订阅 typeAllMask（那会把文本变化、滚动、点击全量投递进来）。
+  - accessibilityFeedbackType="feedbackGeneric"：不宣称任何特殊反馈能力。
+  - notificationTimeout="100"：同一包名的高频切换在 100ms 内合并，降低回调次数。
+  - accessibilityFlags="flagDefault"：不申请任何额外标志位。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canRetrieveWindowContent="false"
+    android:notificationTimeout="100"
+    android:description="@string/accessibility_service_desc" />

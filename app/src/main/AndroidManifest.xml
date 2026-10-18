@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 前台服务（保活，specialUse 类型） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- 重发通知 / 常驻通知可见性（Android 13+ 运行时申请） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 设备重启后恢复延时重发任务 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 精确到点闹钟 -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <!-- 电池优化白名单 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- V4：弹幕 / 自定义位置悬浮通知（叠加层，需用户手动授权「显示在其他应用上层」） -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!--
+      V11：WebDAV 云备份（坚果云等）需要网络。
+      这是本 App 从「纯本地不联网」到「仅在用户显式配置 WebDAV 时联网」的唯一变化：
+      不开启 WebDAV 时，代码路径里没有任何网络调用（BackupRepository 的
+      webDavTarget() 为 null 时直接返回，不会建立连接）。
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+      V9.1（重要）：Android 11+ 的「包可见性」限制。
+      没有这条权限时，getInstalledApplications / queryIntentActivities 只会返回
+      「系统认为可见」的一小部分包，且随交互状态变化 —— 表现为
+      「应用列表有时有、有时没有」「明明装了却不显示」。
+      本 App 是自用侧载（不上架、不需要过 Play 政策），申请全量可见是必要的。
+    -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <application
+        android:name=".NfApplication"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.NotificationFilter"
+        tools:targetApi="34">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 通知监听服务：前台化保活 -->
+        <service
+            android:name=".service.NfNotificationListener"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="notification_filtering" />
+        </service>
+
+        <!-- V7 需求 7-⑥：无障碍服务（只在前台 App 变化时上报包名，不抓取窗口内容）。
+             系统以 BIND_ACCESSIBILITY_SERVICE 绑定，故必须 exported=true 且声明该 permission；
+             label 指向字符串资源（系统无障碍列表里显示的名字）。-->
+        <service
+            android:name=".service.NfAccessibilityService"
+            android:exported="true"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- 重启：重排延时任务 + 恢复常驻通知 -->
+        <receiver
+            android:name=".service.BootReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 延时重发闹钟到点 -->
+        <receiver
+            android:name=".service.RepostAlarmReceiver"
+            android:exported="false" />
+
+        <!-- V11 自动备份闹钟到点（自续期） -->
+        <receiver
+            android:name=".service.BackupAlarmReceiver"
+            android:exported="false" />
+    </application>
+</manifest>

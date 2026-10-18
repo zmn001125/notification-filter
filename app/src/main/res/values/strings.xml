@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">通知过滤</string>
+
+    <!-- 常驻状态通知 -->
+    <string name="status_channel_name">通知过滤 · 状态</string>
+    <string name="status_channel_desc">显示过滤服务的运行状态</string>
+    <string name="status_filtering">过滤中</string>
+    <string name="status_paused">已暂停</string>
+
+    <!-- 替换重发通知 -->
+    <string name="repost_channel_name">替换通知</string>
+    <string name="repost_channel_desc">由通知过滤改写后重发的通知</string>
+
+    <!-- V7 需求 7-⑥：无障碍服务（只读前台应用包名，不读界面内容） -->
+    <string name="accessibility_service_label">通知过滤</string>
+    <string name="accessibility_service_desc">只读取当前前台应用的包名，用于「打开了某个 App 时显示/隐藏卡片」条件；不读取任何界面内容，不联网。未配置该条件的规则不需要开启本服务。</string>
+</resources>
