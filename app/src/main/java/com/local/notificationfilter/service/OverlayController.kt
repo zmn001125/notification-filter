@@ -1382,9 +1382,13 @@ private const val DANMAKU_REUSE_GAP_DP = 24f
  *
  * 用户要求「可以超过 5 条」，所以不再按「同屏最多条数」限流；但每条弹幕都是一个
  * 全宽独立 Window + 独立 ComposeView/Recomposer/Surface，必须留一个防失控的硬顶。
- * 24 条远超实际观感需求（正常情况下轨道数 × 2~3 就到头了）。
+ *
+ * V13.1 耗电修复：由 24 降到 12。每条弹幕在滚动期间是**每帧重绘的半透明全屏宽图层**，
+ * 24 条同时挂在屏幕上 = 24 路 GPU 绘制 + 24 层 SurfaceFlinger 合成，是本项目唯一能
+ * 持续把显示管线压满的路径。12 条仍远超「超过 5 条」的原始要求，也远超正常观感需求
+ * （正常情况轨道数 × 2~3 就到头了）。
  */
-private const val MAX_DANMAKU_WINDOWS = 24
+private const val MAX_DANMAKU_WINDOWS = 12
 
 /** 定位式弹幕「逐条依次出现」的淡入错峰间隔（ms）：第 i 条延迟 i × 本值。 */
 private const val STACK_STAGGER_MS = 150

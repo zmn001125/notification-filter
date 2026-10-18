@@ -170,11 +170,14 @@ class NfNotificationListener : NotificationListenerService() {
             }.getOrDefault(false)
             val wasEnabled = MediaSessionHolder.enabled
             MediaSessionHolder.setEnabled(needed)
+            // V13.1 耗电修复：兜底轮询随开关启停。没有规则引用 media.* 时循环根本不存在
+            // （此前 attach() 无条件启动，一天 5760 次空转唤醒）。
+            mediaSource?.setPollingEnabled(needed)
             NfLog.i(
                 this@NfNotificationListener,
                 "媒体字段采集：${if (needed) "已启用" else "未启用（没有规则引用 $MEDIA_FIELD_PREFIX）"}",
             )
-            // V11.6：刚由关变开时立刻取一次，不用等兜底轮询的下一拍（未播放时最长 15 秒）
+            // V11.6：刚由关变开时立刻取一次，不用等兜底轮询的下一拍
             if (needed && !wasEnabled) mediaSource?.refreshNow()
         }
     }

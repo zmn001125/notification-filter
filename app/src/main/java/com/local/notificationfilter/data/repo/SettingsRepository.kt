@@ -62,8 +62,19 @@ class SettingsRepository(private val store: SettingsStore) {
         store.setHideFromRecents(value)
     }
 
-    /** 一次性读取当前总开关（管线热路径用）。 */
-    suspend fun isMasterEnabled(): Boolean = masterEnabled.first()
+    /**
+     * 一次性读取当前总开关（管线热路径用）。
+     *
+     * V13.1 耗电修复：优先读 [SettingsStore.masterEnabledSnapshot] 进程内快照。
+     * 本方法在**每条通知**的热路径上调用（「媒体变化重扫」里还会对每条通知再调一次）；
+     * 原来每次都 `masterEnabled.first()`——稳态虽是内存读，但每次都要新建 collector、
+     * 挂起一次协程、走一遍 Flow 算子再取消，通知密集时是持续的协程调度开销。
+     *
+     * 快照的唯一写入点是 `SettingsStore.setMasterEnabled`（含备份恢复），故不会陈旧。
+     * `null` = 进程内尚未写过/读过，此时回源一次并记住。
+     */
+    suspend fun isMasterEnabled(): Boolean =
+        store.masterEnabledSnapshot ?: masterEnabled.first().also { store.cacheMasterEnabled(it) }
 
     /** 一次性读取常驻通知开关（服务端 onListenerConnected / BootReceiver 恢复用）。 */
     suspend fun isShowOngoing(): Boolean = showOngoing.first()

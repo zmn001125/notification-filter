@@ -89,7 +89,27 @@ class SettingsStore(private val context: Context) {
     val ongoingRiskAcknowledged: Flow<Boolean> =
         context.nfDataStore.data.map { it[keyOngoingRiskAcknowledged] ?: false }
 
+    /**
+     * V13.1：总开关的进程内快照（**唯一的写入点在本方法**，含备份恢复路径）。
+     *
+     * 为什么放在 Store 而不是 `SettingsRepository`：备份恢复（BackupRepository）直接走
+     * `settingsStore.setMasterEnabled(...)`，若缓存只修在 Repository 的 setter 里，
+     * 恢复后缓存会残留旧值——那会让「恢复了关闭状态」后仍然继续过滤（或反之）。
+     *
+     * `null` = 进程内尚未读过；由 `SettingsRepository.isMasterEnabled()` 惰性填充。
+     * 只服务热路径读取，**不是** [masterEnabled] Flow 的替代品（UI 仍订阅 Flow）。
+     */
+    @Volatile
+    var masterEnabledSnapshot: Boolean? = null
+        private set
+
+    /** 热路径首次回源后回填快照（[masterEnabledSnapshot] 说明）。 */
+    fun cacheMasterEnabled(value: Boolean) {
+        if (masterEnabledSnapshot == null) masterEnabledSnapshot = value
+    }
+
     suspend fun setMasterEnabled(value: Boolean) {
+        masterEnabledSnapshot = value
         context.nfDataStore.edit { it[keyMasterEnabled] = value }
     }
 

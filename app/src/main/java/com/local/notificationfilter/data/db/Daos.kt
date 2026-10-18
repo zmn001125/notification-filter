@@ -254,10 +254,14 @@ abstract class StatsDao {
      * 原 SQL 没有 `epochDay` 条件 → 每条通知都要 `UPDATE` 该包**全部历史日行**
      * （用久了就是几百行/次，每次都是一个 fsync 事务）。统计页按天聚合展示，
      * 历史行保留旧名字不影响使用；App 改名后从当天起显示新名字。
+     *
+     * V13.1 再加 `AND appName <> :appName`：**名字没变时一行都不匹配**，
+     * SQLite 就不会重写这一行、也不追加 WAL 帧。原来这条 UPDATE 对每条通知无条件执行，
+     * 而应用名几乎永远不变 —— 是纯粹的白写。
      */
     @Query(
         "UPDATE stats_daily SET appName = :appName " +
-            "WHERE packageName = :packageName AND epochDay = :epochDay"
+            "WHERE packageName = :packageName AND epochDay = :epochDay AND appName <> :appName"
     )
     abstract suspend fun refreshAppName(packageName: String, appName: String, epochDay: Int)
 
@@ -268,8 +272,10 @@ abstract class StatsDao {
         epochDay: Int,
         filtered: Boolean,
     ) {
-        insertIgnore(StatDailyEntity(packageName, appName, epochDay, 0, 0))
-        refreshAppName(packageName, appName, epochDay)
+        // V13.1：新行已带着正确的 appName 插入，不必再 UPDATE 一遍（省一条写语句）。
+        // insertIgnore 返回 -1 表示「行已存在」，只有这种情况才可能需要刷新应用名。
+        val inserted = insertIgnore(StatDailyEntity(packageName, appName, epochDay, 0, 0))
+        if (inserted == -1L) refreshAppName(packageName, appName, epochDay)
         bump(packageName, epochDay, if (filtered) 1 else 0, if (filtered) 0 else 1)
     }
 
@@ -311,6 +317,13 @@ abstract class BlacklistDao {
 
     @Query("SELECT EXISTS(SELECT 1 FROM blacklist WHERE packageName = :pkg)")
     abstract suspend fun contains(pkg: String): Boolean
+
+    /**
+     * V13.1：一次性取出全部包名，供 [com.local.notificationfilter.data.repo.BlacklistRepository]
+     * 建立进程内缓存（黑名单只有几行，一次全取比每条通知查一次便宜得多）。
+     */
+    @Query("SELECT packageName FROM blacklist")
+    abstract suspend fun allPackages(): List<String>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     abstract suspend fun add(entity: BlacklistEntity)

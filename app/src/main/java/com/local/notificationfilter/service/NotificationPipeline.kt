@@ -11,6 +11,7 @@ import com.local.notificationfilter.core.model.NotificationRecord
 import com.local.notificationfilter.core.model.NotificationSnapshot
 import com.local.notificationfilter.core.model.ResultKind
 import com.local.notificationfilter.core.model.Rule
+import com.local.notificationfilter.core.model.ScopeType
 import com.local.notificationfilter.core.ruleengine.FieldExtractor
 import com.local.notificationfilter.core.ruleengine.RuleEngine
 import com.local.notificationfilter.util.AppUtils
@@ -21,6 +22,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -106,6 +108,24 @@ class NotificationPipeline(
         override fun removeEldestEntry(
             eldest: MutableMap.MutableEntry<String, LiveRow>?,
         ): Boolean = size > MAX_LIVE_RECORDS
+    }
+
+    /**
+     * V13.1 耗电修复：「recordId → 上次写进去的结论签名」表（同值不写）。
+     *
+     * 为什么需要：进度类 / 音乐类通知每秒刷新，而它命中的规则几乎永远不变 →
+     * `updateResult` 每秒都在写**一组完全相同的值**（result / actions / ruleId / hitFields）。
+     * SQLite 每次 UPDATE 都会重写整行并追加 WAL 帧，一晚上就是几万次无意义的事务与唤醒。
+     *
+     * 只在签名真的变了时才发 SQL；值相同则一次都不写（对外行为完全一致——
+     * 读出来的还是那一组值）。
+     *
+     * 线程安全前提与 [recentFingerprints] / [liveRecords] 完全一致：只在 [mutex] 之内
+     * （[handle] / [reprocessActive] / [handleMediaChanged]）与同一单线程 [scope] 中读写。
+     */
+    private val lastResultSignatures = object : LinkedHashMap<Long, Int>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, Int>?): Boolean =
+            size > MAX_RESULT_SIGNATURES
     }
 
     /** [liveRecords] 的值：该 key 当前占用的流水行号 + 最后一次写入时刻。 */
@@ -291,11 +311,39 @@ class NotificationPipeline(
      * 成本可控：通知栏通常几十条，且整条路径已被 [MediaSessionHolder.enabled] 与
      * 「有规则引用 media.*」双重门控（没有规则引用时 onMediaChanged 根本不会触发）。
      *
+     * ## V13.1 耗电修复：合并执行 + 候选收窄
+     * 播放器逐句刷新 metadata 时（2~5 秒一句，个别播放器写入更频繁）会连着触发本函数，
+     * 而一次执行 = 1 次 `getActiveNotifications` binder + 通知栏条数 ×（全量 extras dump
+     * + 黑名单查询 + 可能的 UPDATE）。几十条 × 每 2 秒 = 每分钟上千次 DB 写，是放歌时
+     * 耗电飙升的直接来源。两道闸门：
+     * 1. **合并执行**（[scheduleMediaScan]）：间隔 [MEDIA_SCAN_MIN_INTERVAL_MS] 内的连续
+     *    变化只跑最后一次，**不丢内容**（跑的永远是最新一次，与 V11.5 删掉的「丢弃式节流」
+     *    是两回事——那个会把内容永久丢掉）；
+     * 2. **候选收窄**：没有 [liveRecords] 行（无需刷新内容）且**没有任何 media 规则的作用域
+     *    可能匹配它**的通知，直接跳过 `FieldExtractor` 全量 dump（规则引擎本来也会因作用域
+     *    不匹配而判不中，这里只是提前短路，语义完全等价）。
+     *
      * @param packageName 媒体会话所属包名（**仅用于日志**：候选是全量通知，不再按它过滤）
      */
     fun onMediaChanged(packageName: String) {
-        scope.launch { handleMediaChanged(packageName) }
+        val seq = ++mediaScanSeq
+        scope.launch {
+            val wait = MEDIA_SCAN_MIN_INTERVAL_MS - (System.currentTimeMillis() - lastMediaScanAt)
+            if (wait > 0) delay(wait)
+            // 合并执行：期间又有更新的媒体变化排上了队 → 本次让位，由最后一次跑
+            if (seq != mediaScanSeq) return@launch
+            handleMediaChanged(packageName)
+            lastMediaScanAt = System.currentTimeMillis()
+        }
     }
+
+    /** [onMediaChanged] 的合并令牌：每次新变化自增，只有持有最新值的那次协程真正执行。 */
+    @Volatile
+    private var mediaScanSeq = 0L
+
+    /** 上次真正执行媒体重扫的时刻（[onMediaChanged] 合并窗口的起点）。 */
+    @Volatile
+    private var lastMediaScanAt = 0L
 
     private suspend fun handleMediaChanged(packageName: String) = mutex.withLock {
         if (!MediaSessionHolder.enabled) return@withLock
@@ -320,6 +368,13 @@ class NotificationPipeline(
             // V12.1：没有 liveRecords 行的存量通知（App 重启前就在通知栏的 / 被本 App
             // 消除过残留的）也要求值，只是没有行可写、不落任何库。
             val row = liveRecords[sbn.key]
+            // V13.1 耗电修复：既没有行要刷新、又没有 media 规则的作用域可能匹配它 →
+            // 连 FieldExtractor 的全量 extras dump 都省掉（规则引擎本就会因作用域判不中）。
+            if (row == null && mediaRules.isNotEmpty() &&
+                mediaRules.none { scopeCouldMatch(it, sbn.packageName) }
+            ) {
+                continue
+            }
             val appName = AppUtils.appNameOf(appContext, sbn.packageName)
             val snapshot = FieldExtractor.fromStatusBar(sbn, appName)
             if (row != null) {
@@ -658,7 +713,7 @@ class NotificationPipeline(
         when (evaluation) {
             is Evaluation.Blacklist -> {
                 if (!evaluation.cancelled) return
-                container.recordRepository.updateResult(
+                writeResult(
                     recordId = recordId,
                     result = ResultKind.BLOCK,
                     actions = listOf(ActionType.BLOCK),
@@ -680,7 +735,7 @@ class NotificationPipeline(
             }
 
             is Evaluation.Matched -> {
-                container.recordRepository.updateResult(
+                writeResult(
                     recordId = recordId,
                     result = evaluation.kind,
                     actions = evaluation.executed,
@@ -695,7 +750,10 @@ class NotificationPipeline(
                 if (!alreadyCounted) {
                     container.statsRepository.increment(packageName, appName, epochDay, filtered = filtered)
                 }
-                NfLog.i(
+                // V13.1 耗电修复：命中是**最高频**的日志点（进度类通知每秒都能命中一次），
+                // 而 Log.i 是向 logd 的 socket 写；降到 d 后 release 下自动关闭
+                // （NfLog 的级别开关），异常 / 降级仍走 i / w。
+                NfLog.d(
                     this,
                     "规则命中「${evaluation.rule.name}」pkg=$packageName " +
                         "result=${evaluation.kind} actions=${evaluation.executed}" +
@@ -733,7 +791,7 @@ class NotificationPipeline(
             live.lastWriteAt = now
             if (paused && !live.pausedReset) {
                 // 暂停期间不跑规则 → 这一行不该继续挂着暂停前的「消除 / 推迟 / 替换」
-                container.recordRepository.updateResult(
+                writeResult(
                     recordId = live.recordId,
                     result = ResultKind.PASS,
                     actions = emptyList(),
@@ -802,6 +860,39 @@ class NotificationPipeline(
         else -> ResultKind.PASS
     }
 
+    /**
+     * 写结论的**唯一入口**（V13.1）：与上次写入的签名相同则不发 SQL。
+     *
+     * 见 [lastResultSignatures] 的说明。四个调用点（三种判定分支 + 暂停期拉回）
+     * 全部走这里，保证「同值不写」口径一致。
+     */
+    private suspend fun writeResult(
+        recordId: Long,
+        result: ResultKind,
+        actions: List<ActionType>,
+        hitFields: Set<FieldRef>,
+        ruleId: Long?,
+        ruleName: String?,
+        blacklistHit: Boolean,
+    ) {
+        var sig = result.ordinal * 31 + (ruleId?.hashCode() ?: 0)
+        sig = sig * 31 + actions.hashCode()
+        sig = sig * 31 + hitFields.hashCode()
+        sig = sig * 31 + (ruleName?.hashCode() ?: 0)
+        sig = sig * 31 + if (blacklistHit) 1 else 0
+        if (lastResultSignatures[recordId] == sig) return // 同值：一次 UPDATE 都不发
+        container.recordRepository.updateResult(
+            recordId = recordId,
+            result = result,
+            actions = actions,
+            hitFields = hitFields,
+            ruleId = ruleId,
+            ruleName = ruleName,
+            blacklistHit = blacklistHit,
+        )
+        lastResultSignatures[recordId] = sig
+    }
+
     private fun encodeExtras(snapshot: NotificationSnapshot): String = runCatching {
         NfJson.encodeToString(
             ListSerializer(PairSerializer(String.serializer(), String.serializer())),
@@ -846,6 +937,30 @@ class NotificationPipeline(
          * 都是「立刻呈现新内容」的语义，正是这条路径存在的意义。
          */
         val MEDIA_SKIP_ACTIONS: Set<ActionType> = setOf(ActionType.SNOOZE)
+
+        /**
+         * V13.1：「媒体内容变化 → 重跑规则」的最小执行间隔（[onMediaChanged] 合并窗口）。
+         *
+         * 1.5 秒的依据：歌词换句粒度是 2~5 秒，1.5 秒不会把任何一句的真实变化并掉，
+         * 又足以把「播放器以更高频率写 metadata」的情形压到每秒不足一次。
+         * **是合并（跑最新一次）而不是丢弃**（V11.5 的红线：内容不能丢）。
+         */
+        const val MEDIA_SCAN_MIN_INTERVAL_MS = 1_500L
+
+        /** [lastResultSignatures] 容量上限（LRU）：只需覆盖「同时在刷新的通知条数」。 */
+        const val MAX_RESULT_SIGNATURES = 256
+    }
+
+    /**
+     * 一条规则的作用域**是否可能**匹配某包名（V13.1 候选收窄用）。
+     *
+     * 与 `RuleEngine` 里的真实判定同口径（GLOBAL 恒真 / ONLY 命中集合 / EXCLUDE 不命中集合），
+     * 这里只用于在「重扫候选」里提前短路掉**必然判不中**的通知，语义与跑完规则引擎等价。
+     */
+    private fun scopeCouldMatch(rule: Rule, packageName: String): Boolean = when (rule.scope.type) {
+        ScopeType.GLOBAL -> true
+        ScopeType.ONLY -> packageName in rule.scope.packages
+        ScopeType.EXCLUDE -> packageName !in rule.scope.packages
     }
 }
 
@@ -980,11 +1095,28 @@ internal fun extrasSignature(extras: List<Pair<String, String>>): String =
         key + "=" + stableExtraValue(value)
     }
 
-/** `[B@1a2b3c (byte[1024])` → `[byte[1024]]`；其它值原样返回。 */
-private val BYTE_ARRAY_SIGNATURE = Regex("^\\[B@[0-9A-Fa-f]+ \\(byte\\[(\\d+)]\\)$")
-
-private fun stableExtraValue(value: String): String =
-    BYTE_ARRAY_SIGNATURE.matchEntire(value)?.let { "[byte[" + it.groupValues[1] + "]]" } ?: value
+/**
+ * `[B@1a2b3c (byte[1024])` → `[byte[1024]]`；其它值原样返回。
+ *
+ * V13.1 耗电修复：这里原来是 `Regex.matchEntire`，而它对**每个 extras 值**都跑一次正则匹配；
+ * 媒体类通知的 extras 能有 30~50 个键，于是每条通知就是几十次正则匹配，
+ * 进度类通知每秒刷新时更是持续 CPU 占用。改成常量时间的字符串判定，语义完全等价
+ * （`dumpExtras` 产出的 ByteArray 形式固定，正则只是把它拆出长度）。
+ */
+private fun stableExtraValue(value: String): String {
+    // 形式固定为 "[B@<hex> (byte[<n>])"：确认前缀 / 后缀并切出长度数字即可
+    if (!value.startsWith("[B@")) return value
+    val open = value.indexOf("(byte[")
+    if (open < 0 || !value.endsWith("])")) return value
+    val digitsStart = open + "(byte[".length
+    val digitsEnd = value.length - "])".length
+    if (digitsEnd <= digitsStart) return value
+    for (i in digitsStart until digitsEnd) {
+        val c = value[i]
+        if (c < '0' || c > '9') return value
+    }
+    return "[byte[" + value.substring(digitsStart, digitsEnd) + "]]"
+}
 
 /**
  * V10.11：`key → 流水行号` 映射表的容量上限（LRU）。

@@ -77,7 +77,19 @@ class MediaSessionSource(context: Context) {
             bindAll(manager.getActiveSessions(component))
             NfLog.i(this, "媒体会话采集已挂载（${bindings.size} 个会话）")
         }.onFailure { NfLog.w(this, "媒体会话采集挂载失败: ${it.message}") }
-        startRefresher()
+    }
+
+    /**
+     * V13.1 耗电修复：**按需启停兜底轮询**（原实现在 `attach()` 里无条件启动，
+     * 于是即使 [MediaSessionHolder.enabled] 为 false——没有任何规则引用 `media.*`——
+     * 也有一个协程每 15 秒醒来一次，一天 5760 次无意义唤醒；前台服务不让进程进入 Doze，
+     * 这些唤醒全部按满速执行，是「什么都没开也耗电」的直接来源）。
+     *
+     * 现在只有 [MediaSessionHolder.enabled] 为 true 时才存在这个循环；
+     * 规则改回不引用 `media.*` 时 [stopRefresher] 立刻取消，回到零唤醒。
+     */
+    fun setPollingEnabled(enabled: Boolean) {
+        if (enabled) startRefresher() else stopRefresher()
     }
 
     /**
@@ -119,13 +131,16 @@ class MediaSessionSource(context: Context) {
      * 于是能绕开失效的回调，拿到最新的歌词/标题。
      *
      * ## 开销（项目「无轮询」红线的唯一例外，边界写死）
-     * - `enabled == false`（没有任何规则引用 `media.*`）→ **一次 binder 都不调**；
-     * - 有会话在播放 → [POLL_PLAYING_MS]（1 秒一次，歌词换句粒度足够）；
-     * - 没在播放 → [POLL_IDLE_MS]（15 秒一次，只为发现「刚开始播放」）。
+     * - V13.1：`enabled == false`（没有任何规则引用 `media.*`）→ **循环根本不存在**
+     *   （由 [setPollingEnabled] 启停，见那里的说明）；
+     * - 有会话在播放 → [POLL_PLAYING_MS]（V13.1 起 1 秒一次；歌词换句粒度 2~5 秒，
+     *   原来 500ms 有一半是白跑的唤醒）；
+     * - 没在播放 → [POLL_IDLE_MS]（V13.1 起 60 秒一次，只为兜底发现「刚开始播放」；
+     *   正常路径靠 `onPlaybackStateChanged` 回调，这里只是兜底，不需要 15 秒）。
      *   暂停/停止后不会继续高频唤醒。
      */
-    private fun startRefresher() {
-        if (refreshJob != null) return
+    fun startRefresher() {
+        if (refreshJob?.isActive == true) return
         refreshJob = scope.launch {
             while (isActive) {
                 val playing = MediaSessionHolder.enabled &&
@@ -135,6 +150,12 @@ class MediaSessionSource(context: Context) {
                 refreshFromSessions()
             }
         }
+    }
+
+    /** 停掉兜底轮询（[setPollingEnabled] 的另一半）。取消后回到零唤醒。 */
+    fun stopRefresher() {
+        refreshJob?.cancel()
+        refreshJob = null
     }
 
     /**
@@ -315,10 +336,20 @@ class MediaSessionSource(context: Context) {
     }
 
     private companion object {
-        /** 播放中：每秒取一次（歌词换句粒度 2~5 秒，1 秒足够跟手）。 */
-        const val POLL_PLAYING_MS = 500L
+        /**
+         * 播放中：每秒取一次（歌词换句粒度 2~5 秒，1 秒足够跟手）。
+         *
+         * V13.1 由 500ms 放宽到 1000ms：一次 tick 是 `getActiveSessions` +
+         * 每个会话 2 次 binder，播放时每 500ms 一轮纯属过度采样，砍一半唤醒。
+         */
+        const val POLL_PLAYING_MS = 1_000L
 
-        /** 未播放：15 秒取一次，只为发现「刚开始播放」，不做高频唤醒。 */
-        const val POLL_IDLE_MS = 15_000L
+        /**
+         * 未播放：60 秒取一次，只为兜底发现「刚开始播放」。
+         *
+         * V13.1 由 15s 放宽到 60s：正常路径有 `onPlaybackStateChanged` 回调，
+         * 这里只是回调丢失时的兜底，15 秒的唤醒密度没有意义。
+         */
+        const val POLL_IDLE_MS = 60_000L
     }
 }
