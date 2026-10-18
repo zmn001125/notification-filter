@@ -2,7 +2,6 @@ package com.local.notificationfilter.service
 
 import com.local.notificationfilter.actions.AggregationRecorder
 import com.local.notificationfilter.core.model.AggregationLists
-import com.local.notificationfilter.core.model.FloatStyle
 import com.local.notificationfilter.core.model.NotificationSnapshot
 import com.local.notificationfilter.core.model.OverlayPayload
 import com.local.notificationfilter.core.model.OverlayTrigger
@@ -63,6 +62,15 @@ internal class TriggerIndex(
     val clockSensitive: Set<Long> = emptySet(),
     /** 参与条件求值的规则本体（id → Rule），运行期取样式与聚合配置用。 */
     val rules: Map<Long, Rule> = emptyMap(),
+
+    /**
+     * V12：被条件的 `targetRuleId` 引用、且 [RuleActionConfig.float] 非空的目标规则
+     * （id → Rule）。**不含**条件规则自身——它本来就在 [rules] 里。
+     *
+     * 用途：条件的「显示 / 立即清除」可以打到**别的规则**的悬浮窗上（用它自己的样式与
+     * 内容），于是不同规则的悬浮窗能同时在屏幕上存在、互不顶掉。
+     */
+    val targets: Map<Long, Rule> = emptyMap(),
 ) {
 
     /** `DEVICE_STATE` / `CLOCK_AT` 的并集（架构 §3.4 `TriggerIndex.stateful`）。 */
@@ -129,6 +137,8 @@ internal class TriggerIndex(
             val deviceSensitive = LinkedHashSet<Long>()
             val clockSensitive = LinkedHashSet<Long>()
             val kept = LinkedHashMap<Long, Rule>()
+            // V12：被 targetRuleId 引用的目标规则（有 float 才收；自身不收）
+            val targets = LinkedHashMap<Long, Rule>()
 
             for (rule in rules) {
                 if (!rule.enabled) continue
@@ -140,6 +150,15 @@ internal class TriggerIndex(
                 kept[rule.id] = rule
                 var needsTick = false
                 for (trigger in effective) {
+                    // V12：收集「这条条件作用于哪条规则的悬浮窗」。目标从全量列表解析，
+                    // 有 float 才进 targets（没有悬浮样式的规则被指向也没有窗口可作用）；
+                    // 指向自身不进（它本来就在 rules 里）。
+                    val targetId = trigger.targetRuleId
+                    if (targetId != null && targetId != rule.id && targetId !in targets) {
+                        rules.firstOrNull { it.id == targetId }
+                            ?.takeIf { it.actions.float != null }
+                            ?.let { targets[targetId] = it }
+                    }
                     when (trigger.kindEnum) {
                         OverlayTriggerKind.APP_NOTIFICATION ->
                             trigger.packages.forEach { pkg ->
@@ -183,6 +202,7 @@ internal class TriggerIndex(
                 deviceSensitive = deviceSensitive,
                 clockSensitive = clockSensitive,
                 rules = kept,
+                targets = targets,
             )
         }
     }
@@ -211,9 +231,9 @@ fun interface OverlayPayloadBuilder {
 }
 
 /**
- * 条件卡片编排器（V7 需求 7 + 8 的运行时，架构 §3.2 / §3.3 / §3.4 / §3.9）。
+ * 条件悬浮编排器（V7 需求 7 + 8 的运行时，架构 §3.2 / §3.3 / §3.4 / §3.9；V12 扩展为多窗口）。
  *
- * 职责一句话：**把「事件 / 设备状态 / 分钟」翻译成「条件卡片的显示 / 原地更新 / 撤下」**。
+ * 职责一句话：**把「事件 / 设备状态 / 分钟」翻译成「悬浮窗的显示 / 原地更新 / 撤下」**。
  *
  * 三条不变量（实现时逐条落实，改动前请先读）：
  * 1. **订阅数恒为 3~5 个**（与条件条数完全解耦）：本类各订阅**一次**
@@ -221,7 +241,7 @@ fun interface OverlayPayloadBuilder {
  *    一个分钟 ticker、以及用于重新编译的 `RuleRepository.observeAll()`。
  *    条件本身**永远不持有监听器**（红线 1）。
  * 2. **无规则 = 零开销**（红线 2）：[compile] 产出空 [TriggerIndex] 时立即退订全部事件源、
- *    不启动 ticker、撤下残留卡片；唯一保留的常驻成本是 `observeAll()` 的一次 Flow 订阅
+ *    不启动 ticker、撤下本类开过的悬浮窗；唯一保留的常驻成本是 `observeAll()` 的一次 Flow 订阅
  *    （否则规则新增后没人重编译）。
  * 3. **通知密集时不遍历所有规则**（红线 3）：只对 [TriggerIndex] 桶内的规则求值。
  *
@@ -231,9 +251,9 @@ fun interface OverlayPayloadBuilder {
  * `ConcurrentHashMap` 的单键操作，不做跨线程遍历。
  *
  * 与 `OverlayController` 的分工：本类**不做任何窗口操作**，只调用
- * `showConditionalFloat` / `updateConditionalFloat` / `dismissConditionalFloat`；
- * 「同规则原地更新 vs 新规则替换」由控制器内部判定（它持有窗口与门面状态，
- * 判断才不会跨线程失真）。
+ * `OverlayController.showFloat` / `updateFloat` / `dismissFloat`（V12 起按目标规则 id
+ * 一规则一窗，不同规则的悬浮窗互不顶掉）；「同 key 原地更新 vs 重建」由控制器内部判定
+ * （它持有窗口与门面状态，判断才不会跨线程失真）。
  */
 class OverlayConditionArbiter(
     private val ruleRepository: RuleRepository,
@@ -258,15 +278,17 @@ class OverlayConditionArbiter(
     private var index: TriggerIndex = TriggerIndex.EMPTY
 
     /**
-     * 本类视角的「当前卡片是哪条规则」（key = 规则 id 的字符串形式）。
+     * 「悬浮窗口 key（目标规则 id 字符串）→ 开它的 owner 规则 id」（V12）。
      *
-     * 只用于「HIDE 时只摘自己的」与「refreshCard 是否值得重绘」两处判断；
-     * 真实窗口是否存在由 `OverlayController.conditionalFloatKey` 表达。
-     * 允许短暂失真：`showConditionalFloat` 自带「同 key → 原地更新 / 不同 key → 重建」幂等语义，
-     * 因此失真不会导致重复入场动画。
+     * 替代旧 `cardKey`（从「一张卡片」扩成「多扇窗」），只用于两处判断：
+     * 1. [onForeground]：把当前正显示窗口的 owner 规则也带回求值（退出事件不在桶里）；
+     * 2. [pruneRuntimeState]：目标规则已失效 → 撤下对应窗口。
+     * 真实窗口是否存在由 `OverlayController.floatKeys` 表达（[refreshCard] 按它校验，
+     * 用户刚清屏后绝不复活）。
+     * 允许短暂失真：窗口被用户清屏 / 自动消失后条目仍在，但 showFloat 幂等、
+     * refreshCard 有实况校验，失真不会导致错误的重复入场。
      */
-    @Volatile
-    private var cardKey: String? = null
+    private val shownKeys = ConcurrentHashMap<String, Long>()
 
     private var eventsJob: Job? = null
     private var deviceJob: Job? = null
@@ -319,7 +341,7 @@ class OverlayConditionArbiter(
     }
 
     /**
-     * 卸载：取消全部订阅（含 ticker 与规则流）、清空运行时状态、撤下条件卡片。
+     * 卸载：取消全部订阅（含 ticker 与规则流）、清空运行时状态、撤下本类开过的悬浮窗。
      *
      * **幂等**；调用点：`NfNotificationListener.teardown()`（断连 / 销毁共用）。
      * 索引本身（[index]）**不清空**——它只是编译产物，重连时 [attach] 会立刻按它恢复订阅。
@@ -333,7 +355,10 @@ class OverlayConditionArbiter(
         scope?.cancel()
         scope = null
         clearRuntimeState()
-        OverlayController.dismissConditionalFloat(null)
+        // V12：撤下本类开过的所有悬浮窗（只撤 shownKeys 里的——业务悬浮不归本类管）。
+        // detach/compile 可能在非主线程调用，dismissFloat 内部已 post 主线程，安全。
+        shownKeys.keys.toList().forEach { OverlayController.dismissFloat(it) }
+        shownKeys.clear()
         NfLog.i(this, "条件编排器已卸载")
     }
 
@@ -363,10 +388,11 @@ class OverlayConditionArbiter(
 
         if (built.isEmpty) {
             stopSubscriptions()
-            OverlayController.dismissConditionalFloat(null)
-            cardKey = null
+            // V12：没有条件规则了 → 撤下本类开过的悬浮窗（业务悬浮不受影响）
+            shownKeys.keys.toList().forEach { OverlayController.dismissFloat(it) }
+            shownKeys.clear()
             if (before != 0) {
-                NfLog.i(this, "条件卡片索引已清空（无从条件规则），事件源全部退订")
+                NfLog.i(this, "条件索引已清空（无从条件规则），事件源全部退订")
             }
             return
         }
@@ -393,12 +419,15 @@ class OverlayConditionArbiter(
      * 记住一条通知命中规则时的快照（管线在命中点调用，用于卡片内容渲染）。
      *
      * 除了「命中的这条规则自己」要吃这份快照，还要顺手喂给**引用了它的条件规则**
-     * （条件 ⑤「满足某规则的通知出现」）：否则那张卡片拿不到任何通知内容，
+     * （条件 ⑤「满足某规则的通知出现」）：否则那张悬浮窗拿不到任何通知内容，
      * 只能渲染成一张合成快照（规则名 + 模板）。命中规则本身通常不是条件规则，
      * 所以这一步是条件 ⑤ 能看到真实内容的唯一途径。
      *
-     * **零成本保证**：无任何条件规则时 `index.isEmpty` 直接返回；既不是条件规则、
-     * 也没有任何规则引用它时直接返回。因此没有条件卡片的用户，每条通知只多两次判断。
+     * V12：`targetRuleId` 指向的**目标规则**同样要留存快照——它的悬浮窗由条件驱动
+     * 显示，没有快照就只剩合成内容（规则名 + 模板）。
+     *
+     * **零成本保证**：无任何条件规则时 `index.isEmpty` 直接返回；既不是条件规则 /
+     * 目标规则、也没有任何规则引用它时直接返回。因此没有条件悬浮的用户，每条通知只多两次判断。
      *
      * @param ruleId 命中的规则 id
      * @param snapshot 本次命中的通知快照
@@ -406,7 +435,7 @@ class OverlayConditionArbiter(
     fun rememberSnapshot(ruleId: Long, snapshot: NotificationSnapshot) {
         val current = index
         if (current.isEmpty) return
-        val isConditional = ruleId in current.rules
+        val isConditional = ruleId in current.rules || ruleId in current.targets
         val referencing = current.byRuleId[ruleId].orEmpty()
         if (!isConditional && referencing.isEmpty()) return
         if (lastSnapshots.size >= MAX_SNAPSHOTS) {
@@ -420,25 +449,31 @@ class OverlayConditionArbiter(
     }
 
     /**
-     * 请求重绘某条规则的条件卡片（聚合列表新增条目后调用）。
+     * 请求重绘某条规则的悬浮窗内容（聚合列表新增条目后调用）。
      *
-     * 「当前卡片是不是这条规则」的判定**必须放进行内执行**（在单线程 scope 上排队）：
-     * 回调来自管线线程，它比编排器自己的「显示」流程更早或更晚都可能（
-     * `cardKey` 此刻也许还没被写入）。放进 scope 后，判定的执行顺序天然排在
-     * 之前那次 `applyShow` 之后，于是「新条目到了但卡片还显示旧内容」不会发生。
+     * 「窗口还在不在」的判定**必须放进行内执行**（在单线程 scope 上排队）：
+     * 回调来自管线线程，它比编排器自己的「显示」流程更早或更晚都可能。放进 scope 后，
+     * 判定的执行顺序天然排在之前那次 `applyShow` 之后，于是「新条目到了但窗口还显示旧内容」
+     * 不会发生；反过来用户刚点了「清除屏幕显示」时窗口已不在，本次刷新直接跳过，
+     * **绝不会把用户清掉的悬浮重新拉起来**。
+     *
+     * V12：入口放宽到目标规则（[TriggerIndex.targets]）——它的悬浮窗同样可能是条件开的，
+     * 聚合条目变了也要刷新。
      *
      * @param ruleId 规则 id
      */
     fun refreshCard(ruleId: Long) {
         val current = index
         if (current.isEmpty) return
-        if (ruleId !in current.rules) return
+        if (ruleId !in current.rules && ruleId !in current.targets) return
         val s = scope ?: return
         if (!attached) return
         s.launch {
-            if (cardKey != ruleId.toString()) return@launch // 卡片没在显示这条规则 → 无需重绘
-            val rule = index.rules[ruleId] ?: return@launch
-            applyShow(rule, contentOnly = true)
+            // 窗口不在（用户刚清屏 / 已自动消失 / 服务断连全清）→ 绝不复活
+            if (ruleId.toString() !in OverlayController.floatKeys) return@launch
+            val rule = index.rules[ruleId] ?: index.targets[ruleId] ?: return@launch
+            val payload = buildPayload(rule) ?: return@launch
+            OverlayController.updateFloat(rule.id.toString(), payload)
         }
     }
 
@@ -601,15 +636,16 @@ class OverlayConditionArbiter(
     /**
      * 前台 App 变化。
      *
-     * 注意除桶内规则外还要**再求值「当前正显示卡片的那条规则」**：
+     * 注意除桶内规则外还要**再求值「当前正显示窗口的 owner 规则」**：
      * 「打开支付宝显示 → 退出就消失」的退出事件发生在**别的包名**上，
-     * 那个包名不在该规则的桶里（桶只记支付宝），不带上当前卡片就会永远不消失。
+     * 那个包名不在该规则的桶里（桶只记支付宝），不带上当前 owner 就会永远不消失。
+     * V12：窗口可能开在多扇（不同目标规则），故把 [shownKeys] 里所有 owner 都带上。
      */
     private suspend fun onForeground(pkg: String?) {
         val current = index
         val ids = LinkedHashSet<Long>()
         ids += current.onForeground(pkg)
-        cardKey?.toLongOrNull()?.let { showing -> if (showing in current.rules) ids += showing }
+        shownKeys.values.forEach { ownerId -> if (ownerId in current.rules) ids += ownerId }
         if (ids.isEmpty()) return
         val now = System.currentTimeMillis()
         for (ruleId in ids) {
@@ -656,14 +692,25 @@ class OverlayConditionArbiter(
             foregroundPackage = ForegroundAppHolder.current,
             firedClockKeys = clockKeysOf(ruleId, now),
         )
-        val decision = OverlayTriggerEvaluator.decide(triggers, context)
-        // 先求值再登记「本分钟已触发」：否则 CLOCK_AT 会在同一分钟内被自己挡掉
+        // 求值上下文（含 firedClockKeys 快照）已在上面取好，这里再登记「本分钟已触发」：
+        // 上下文是不可变快照，登记不会影响本次求值；而同一分钟的后续 tick 会被挡掉，
+        // 于是 CLOCK_AT 每分钟只生效一次（顺序反了才会被自己挡掉）。
         markClockFired(ruleId, triggers, now)
 
-        when {
-            decision.shouldHide -> hideCard(ruleId)
-            decision.shouldShow -> applyShow(rule)
-            else -> Unit // isNoop：保持现状
+        // V12：按「目标规则」分组独立求值——同一规则的多条条件可以分别作用于不同规则的
+        // 悬浮窗（targetRuleId 为空 = 本条规则自己的），各组互不影响、可同时显示；
+        // 组内多条仍是 OR、HIDE 优先（由 OverlayTriggerEvaluator.decide 保证）。
+        val byTarget = LinkedHashMap<Long, MutableList<OverlayTrigger>>()
+        for (trigger in triggers) {
+            byTarget.getOrPut(trigger.targetRuleId ?: ruleId) { mutableListOf() }.add(trigger)
+        }
+        for ((targetId, subset) in byTarget) {
+            val subsetDecision = OverlayTriggerEvaluator.decide(subset, context)
+            when {
+                subsetDecision.shouldHide -> hideCard(ruleId, targetId)
+                subsetDecision.shouldShow -> applyShow(rule, targetId)
+                else -> Unit // isNoop：保持现状
+            }
         }
     }
 
@@ -698,61 +745,58 @@ class OverlayConditionArbiter(
     // ==================== 决策落地 ====================
 
     /**
-     * 显示 / 原地更新条件卡片。
+     * 显示 / 原地更新某个目标规则的悬浮窗（V12）。
      *
-     * 「同规则 → 原地更新」的判定刻意放在 `OverlayController.showConditionalFloat` 内部：
+     * 「同 key 同样式 → 原地更新」的判定刻意放在 `OverlayController.showFloat` 内部：
      * 只有那里同时持有窗口与 Compose 状态，判断不会跨线程失真；本类重复调用它是幂等的，
      * 也不会重播入场动画（架构 §3.4 红线 4）。
      *
-     * @param rule 目标规则
-     * @param contentOnly true = 只刷新内容（[refreshCard] 的路径）。此时若控制器里已经**没有**
-     *   同 key 的窗口（用户在首页点了「清除屏幕显示」/ 服务断连全清），就跳过本次刷新，
-     *   绝不能让「后台来了一条聚合条目」把用户刚清掉的卡片重新拉起来。
+     * @param owner 条件所属的规则（求值入口那条）
+     * @param targetId 目标规则 id：等于 [owner] 的 id = 作用于本条规则自己的悬浮窗；
+     *   否则从 [TriggerIndex.targets] 取目标规则本体（用它的样式与内容开窗）
      */
-    private suspend fun applyShow(rule: Rule, contentOnly: Boolean = false) {
-        val style = rule.actions.float ?: return
-        val key = rule.id.toString()
-        val payload = buildPayload(rule) ?: return
-        // V9 语义修正：条件只做「提前显示」，复用**普通悬浮槽位**（不再另开条件卡片）。
-        // 这样「条件显示的悬浮」与「通知触发显示的悬浮」是同一张卡：样式、停留时长、
-        // 动画全按样式执行；后续命中新通知也会正常刷新内容（不会被条件挡住）。
-        val shown = OverlayController.showFloat(payload, style)
-        if (shown) {
-            cardKey = key
+    private suspend fun applyShow(owner: Rule, targetId: Long) {
+        val target = if (targetId == owner.id) {
+            owner
         } else {
-            NfLog.w(this, "条件触发显示悬浮失败（无悬浮窗权限或未初始化）rule=${rule.id}")
+            index.targets[targetId] ?: run {
+                NfLog.w(this, "条件目标规则不存在或未配置悬浮 target=$targetId owner=${owner.id}")
+                return
+            }
+        }
+        val style = target.actions.float ?: return
+        val key = target.id.toString()
+        val payload = buildPayload(target) ?: return
+        // V12：样式只做**分隔符修补**——渲染层用「标题 + 分隔符 + 正文」拼文案，正文为空
+        // 时会渲染成「规则名 · 」这种半截字符串。其余字段（含 touchable）原样透传：
+        // 业务悬浮已统一走普通窗口口径，不再由本类推导窗口差异。
+        val fixedStyle = style.copy(
+            separator = if (payload.text.isBlank()) "" else style.separator,
+        )
+        val shown = OverlayController.showFloat(key, payload, fixedStyle)
+        if (shown) {
+            shownKeys[key] = owner.id
+        } else {
+            NfLog.w(this, "条件触发显示悬浮失败（无悬浮窗权限或未初始化）rule=${target.id}")
         }
     }
 
     /**
-     * 立即清除悬浮（V9：作用于**普通悬浮槽位**）。
+     * 立即清除某个目标规则的悬浮窗（V12）。
      *
      * 用户原话：「设定了条件指定某个 APP 的通知消失，那么悬浮就清除，就立即执行清除」。
-     * 悬浮全屏只有一个槽位，所以这里不再校验 key —— 条件命中的语义就是「把屏上的浮窗清掉」，
-     * 校验 key 反而会导致「通知触发的悬浮撤不掉」（那条路径不经过本类，cardKey 不匹配）。
-     */
-    private fun hideCard(ruleId: Long) {
-        NfLog.d(this, "条件命中，立即清除悬浮 rule=$ruleId")
-        OverlayController.dismissFloat()
-        cardKey = null
-    }
-
-    /**
-     * 条件卡片的**运行时样式推导**（主理人已拍板：`touchable` 由功能推导，配置页不暴露）。
+     * V12 起一规则一窗，这里按 key 精确撤下**目标规则**的那一扇，
+     * 不会波及同屏其他规则的悬浮窗。
      *
-     * 两处推导：
-     * 1. `touchable = contentScrollable && maxHeightDp > 0`：只有「限高 + 内部滚动」才需要触摸；
-     *    没有限高时内容全部可见，滚动毫无意义，此时保持穿透（不挡下方 App）。
-     * 2. `separator = ""`（仅当正文为空）：渲染层用「标题 + 分隔符 + 正文」拼文案，
-     *    正文为空时会渲染成「规则名 · 」这种半截字符串。条件卡片在「还没有任何命中通知、
-     *    也没配聚合模板」的初始阶段正是这种状态，故此处去掉分隔符。
-     *    正文非空时**原样保留**用户的配置。
+     * @param ownerRuleId 条件所属的规则（日志用）
+     * @param targetId 目标规则 id（= 要撤下的窗口 key）
      */
-    private fun conditionalStyleOf(style: FloatStyle, payload: OverlayPayload): FloatStyle =
-        style.copy(
-            touchable = style.contentScrollable && style.maxHeightDp > 0f,
-            separator = if (payload.text.isBlank()) "" else style.separator,
-        )
+    private fun hideCard(ownerRuleId: Long, targetId: Long) {
+        val key = targetId.toString()
+        NfLog.d(this, "条件命中，立即清除悬浮 owner=$ownerRuleId target=$targetId")
+        OverlayController.dismissFloat(key)
+        shownKeys.remove(key)
+    }
 
     /**
      * 组装卡片内容载荷。
@@ -782,7 +826,7 @@ class OverlayConditionArbiter(
         val built = runCatching {
             payloadBuilder.build(rule, snapshot, titleTemplate, textTemplate, lists)
         }.onFailure {
-            NfLog.w(this, "渲染条件卡片载荷失败 rule=${rule.id}: ${it.message}")
+            NfLog.w(this, "渲染悬浮窗载荷失败 rule=${rule.id}: ${it.message}")
         }.getOrNull() ?: return null
 
         val title = built.title.ifBlank {
@@ -878,7 +922,8 @@ class OverlayConditionArbiter(
 
     /** 修剪运行时状态：规则被删 / 改成无条件后，其快照与时钟状态不再保留。 */
     private fun pruneRuntimeState(built: TriggerIndex) {
-        val valid = built.rules.keys
+        // V12：有效 id = 条件规则 ∪ 目标规则（两者的快照 / 窗口都可能还开着）
+        val valid = built.rules.keys + built.targets.keys
         // ConcurrentHashMap 不支持跨线程遍历式删除的场景，逐个单键操作最稳
         for (ruleId in lastSnapshots.keys.toList()) {
             if (ruleId !in valid) lastSnapshots.remove(ruleId)
@@ -886,13 +931,13 @@ class OverlayConditionArbiter(
         for (ruleId in clockStates.keys.toList()) {
             if (ruleId !in valid) clockStates.remove(ruleId)
         }
-        val showing = cardKey
-        if (showing != null) {
-            val showingId = showing.toLongOrNull()
-            if (showingId == null || showingId !in valid) {
-                // 正在显示的规则已被删除 / 被改成无条件 → 立刻撤卡（否则会永久留在屏幕上）
-                OverlayController.dismissConditionalFloat(showing)
-                cardKey = null
+        // shownKeys 里引用的目标规则已失效（被删 / 被改成没有悬浮样式）→ 立刻撤下对应窗口，
+        // 否则它会永久留在屏幕上（没有别的路径会来撤它）
+        for (key in shownKeys.keys.toList()) {
+            val targetId = key.toLongOrNull()
+            if (targetId == null || targetId !in valid) {
+                OverlayController.dismissFloat(key)
+                shownKeys.remove(key)
             }
         }
     }
@@ -900,7 +945,7 @@ class OverlayConditionArbiter(
     private fun clearRuntimeState() {
         clockStates.clear()
         lastSnapshots.clear()
-        cardKey = null
+        shownKeys.clear()
     }
 
     /** epoch 毫秒 → 本地日序号（判断 `CLOCK_AT` 的「今日」是否翻篇）。 */

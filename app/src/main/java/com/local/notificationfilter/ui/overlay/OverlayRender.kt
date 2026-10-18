@@ -738,6 +738,13 @@ fun DanmakuBubble(
     replayKey: Int = 0,
     previewMode: Boolean = false,
     onMeasuredHeightDp: ((Float) -> Unit)? = null,
+    /**
+     * V11.8：滚动**真正开始**时回调一次（参数 = 气泡实测宽度 px、本次滚动时长 ms）。
+     *
+     * 控制器据此算出「这条轨道什么时候可以再塞一条弹幕」——
+     * 屏幕右侧留白被让出来之后，新弹幕就能立刻进场，不必等前一条整条滚完。
+     */
+    onScrollStarted: ((bubbleWidthPx: Float, scrollMs: Long) -> Unit)? = null,
 ) {
     val screenWidthDp: Float = LocalConfiguration.current.screenWidthDp.toFloat()
     val density = LocalDensity.current
@@ -765,6 +772,8 @@ fun DanmakuBubble(
             val scrollMs = ((screenPx + bubblePx) / speed * 1000f)
                 .toLong().coerceIn(300L, 30000L)
             offsetXPx.snapTo(screenPx) // 右缘之外起滚
+            // V11.8：动画即将开始，把「宽度 + 时长」交给控制器算轨道复用时刻
+            onScrollStarted?.invoke(bubblePx, scrollMs)
             offsetXPx.animateTo(
                 -bubblePx, // 完全滚出左缘才结束（不停留）
                 tween(durationMillis = scrollMs.toInt()),

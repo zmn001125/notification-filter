@@ -93,6 +93,16 @@ data class OverlayTrigger(
     /** kind = RULE_NOTIFICATION：被引用的规则 id（任一命中即满足）。 */
     val ruleIds: Set<Long> = emptySet(),
 
+    /**
+     * 条件作用的**目标规则** id（V12）。null = 当前规则（本条规则自己的悬浮窗）。
+     * 非 null = 把「显示 / 立即清除」作用到**那条规则**的悬浮窗（用它自己的样式与内容），
+     * 于是不同规则的悬浮窗可以同时在屏幕上存在、互不顶掉。
+     *
+     * 注意：目标是**可选项**，不参与 [isEffective] 的「参数是否配齐」判定——
+     * 配没配目标都不影响这条条件本身的成立与否。
+     */
+    val targetRuleId: Long? = null,
+
     /** kind = APP_NOTIFICATION / RULE_NOTIFICATION：关注「出现」还是「消失」。 */
     val edge: TriggerEdge = TriggerEdge.OCCUR,
 ) {
@@ -119,7 +129,7 @@ data class OverlayTrigger(
     fun summary(): String {
         if (!isEffective) return "（未配置完整）"
         val edgeWord = if (hideWhenFalse) "真/假双向" else effect.label
-        return when (kindEnum) {
+        val base = when (kindEnum) {
             OverlayTriggerKind.DEVICE_STATE -> "设备状态（${device.summary()}）→ $edgeWord"
             OverlayTriggerKind.CLOCK_AT ->
                 "每天 $clockAt → $edgeWord"
@@ -133,6 +143,8 @@ data class OverlayTrigger(
             OverlayTriggerKind.FOREGROUND_APP ->
                 "打开 ${packages.size} 个 App 之一 → $edgeWord"
         }
+        // V12：配了目标规则时在文案末尾点明（用户最关心「这条条件到底动谁的窗」）
+        return if (targetRuleId != null) "$base（作用于指定规则）" else base
     }
 }
 

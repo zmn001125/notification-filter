@@ -6,6 +6,7 @@ import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.TypedValue
 import android.view.Gravity
@@ -56,10 +57,14 @@ import kotlinx.coroutines.flow.StateFlow
  *   - 定位式 POSITIONED：九宫格 [DanmakuStyle.stackAlign] + X/Y 偏移落位，淡入出现、
  *     停留后淡出；多条按 [DanmakuStyle.stackDirection] 堆叠（第 i 条相对基准偏移
  *     i×(条目高+间距)，方向符号见 stackSignOf）；同样受同屏上限约束、满则排队；
- * - **悬浮单实例**：新的命中直接替换当前悬浮（[FloatStyle.displaySeconds] 秒后自动消失，
- *   0 = 常驻；常驻实例另有 [MAX_FLOAT_RESIDENT_MS] 上限兜底 + 首页菜单「清除屏幕显示」
- *   可随时撤下，见 [dismissAll]）；配置对话框的真机预览走独立实例
- *   [floatPreviewWindow]，与业务悬浮互不干扰；
+ * - **悬浮多实例**（V12：按规则 id 一规则一窗，同停靠位自动级联避让）：
+ *   每条规则的悬浮各占一个独立窗口（[showFloat] 的 key = 规则 id 字符串），不同规则
+ *   同时在屏幕上显示、**互不顶掉**；同停靠位 + 同偏移的多个窗口按显示顺序级联避让
+ *   （步进 [FLOAT_CASCADE_STEP_DP]），同屏上限 [MAX_FLOAT_WINDOWS]（安全阀）。
+ *   每条悬浮 [FloatStyle.displaySeconds] 秒后自动消失，0 = 常驻；常驻实例另有
+ *   [MAX_FLOAT_RESIDENT_MS] 上限兜底 + 首页菜单「清除屏幕显示」可随时撤下，见 [dismissAll]）；
+ *   规则编辑页的预览按钮走固定 key [PREVIEW_FLOAT_KEY]，配置对话框的真机预览走独立实例
+ *   [floatPreviewWindow]，两者与业务窗口互不干扰；
  * - **无权限静默跳过**：[canDrawOverlays] 为 false 时一律不弹窗，由调用方记录
  *   [com.local.notificationfilter.core.model.ActionType.OVERLAY_SKIPPED]；
  * - **进程被后台回收时窗口静默消失**（Q7 已接受），不尝试自动重建以免与系统策略冲突；
@@ -96,9 +101,9 @@ object OverlayController {
     /**
      * 正在播放退场动画、等待气泡回调的窗口。
      *
-     * 为什么要单独记：撤下悬浮 / 条件卡片时，槽位（[floatWindow] / [conditionalFloatWindow]）
-     * 会**立刻让出**（否则新内容会写进一张正在消失的卡片），于是这些窗口已经不在任何
-     * 槽位里了。若不在全清时逐个硬摘，它们只能等 [EXIT_TIMEOUT_MS] 超时兜底才真正消失，
+     * 为什么要单独记：撤下悬浮时，槽位（[floatSlots] 中的表项）会**立刻让出**
+     * （否则新内容会写进一张正在消失的窗口），于是这些窗口已经不在任何槽位里了。
+     * 若不在全清时逐个硬摘，它们只能等 [EXIT_TIMEOUT_MS] 超时兜底才真正消失，
      * 用户点「清除屏幕显示」后会看到残留的淡出动画。
      */
     private val exitingWindows = mutableSetOf<OverlayWindow>()
@@ -210,18 +215,26 @@ object OverlayController {
         // 是否放得下改由 showThroughDanmaku 里的「找一条不重叠的 y」决定：
         // 屏幕还有空位就继续显示，真的放不下才排队。
         mainHandler.post {
-            // V10.7 耗电修复：**恢复同屏上限**。
-            // 每条弹幕是一个全宽独立 Window + 独立 ComposeView/Recomposer/Surface，
-            // V9.6 取消上限后可同时挂 10+ 个全宽图层并各自跑动画 —— 实测这是耗电主因之一。
-            // 这里按样式里的「同屏最多条数」硬限流（用户可在样式里调大，但会有功耗代价）。
-            val limit = style.maxConcurrent.coerceAtLeast(1)
-            if (danmakuWindows.size >= limit) {
+            // V10.7 耗电修复：定位式弹幕是固定格子的堆叠，格子满了就排队（行为不变）。
+            // V11.8：**贯穿式不再按条数限流** —— 用户要求「可以超过 5 条」。
+            // 同屏条数改由「一条轨道上能否再塞一条」（[findThroughYDp]）决定：
+            // 轨道能不能复用取决于前一条滚出去多远，天然不会重叠；
+            // 真放不下才排队。仅保留一个安全上限，防止极端情况挂出上百个全宽窗口。
+            if (style.modeEnum == DanmakuMode.POSITIONED) {
+                val limit = style.maxConcurrent.coerceAtLeast(1)
+                if (danmakuWindows.count { it.stackSignature != null } >= limit) {
+                    if (danmakuQueue.size >= MAX_QUEUE) danmakuQueue.removeFirst()
+                    danmakuQueue.addLast(payload to style)
+                    NfLog.d(this, "定位式堆叠已满 $limit，排队等待（队列 ${danmakuQueue.size}）")
+                    return@post
+                }
+            } else if (danmakuWindows.size >= MAX_DANMAKU_WINDOWS) {
                 if (danmakuQueue.size >= MAX_QUEUE) danmakuQueue.removeFirst()
                 danmakuQueue.addLast(payload to style)
-                NfLog.d(this, "弹幕已达同屏上限 $limit，排队等待（队列 ${danmakuQueue.size}）")
-            } else {
-                showDanmakuWindow(context, payload, style)
+                NfLog.d(this, "贯穿式弹幕达安全上限 $MAX_DANMAKU_WINDOWS，排队等待（队列 ${danmakuQueue.size}）")
+                return@post
             }
+            showDanmakuWindow(context, payload, style)
         }
         return true
     }
@@ -235,32 +248,30 @@ object OverlayController {
     }
 
     /**
-     * 贯穿式弹幕窗口：顶部第 [trackIndex] 条轨道（y = topMargin + i×(轨道高+间距)），
-     * 滚动与回收由 [DanmakuBubble] 内的动画驱动。
+     * 贯穿式弹幕窗口：从右向左滚过屏幕。
+     *
+     * V11.8：**同一 y 轨道允许同时挂多条**（只要不重叠，见 [findThroughYDp]），
+     * 因此这里不再占用 `trackIndex`（贯穿式的轨道归属只由 `yDp` 决定）。
      */
     private fun showThroughDanmaku(context: Context, payload: OverlayPayload, style: DanmakuStyle) {
         // V9.6 重写（两个真问题的根因都在这）：
         // ① 条数被 `maxConcurrent` 硬顶住 —— 用户要「不限条数，只要不遮住前面的」；
         // ② y 按「轨道号 × 固定 48dp」算，实测高度一回报就整列重排 ——
         //    屏幕上的弹幕会**突然变个位置**（真机反馈原话）。
-        // 现在：找一条与所有存活弹幕都不重叠的 y，**分配后永不再动**；
-        // 放不下才排队。
+        // 现在：y 一旦分配就**永不再动**；能复用已有轨道就复用（不排队），真放不下才排。
         val estimatedHDp = TRACK_HEIGHT_DP
-        val yDp = findFreeYDp(context, style, estimatedHDp)
+        val yDp = findThroughYDp(context, style, estimatedHDp)
         if (yDp == null) {
             if (danmakuQueue.size >= MAX_QUEUE) danmakuQueue.removeFirst()
             danmakuQueue.addLast(payload to style)
             NfLog.d(this, "屏幕已无空位，弹幕排队等待（队列 ${danmakuQueue.size}）")
             return
         }
-        // trackIndex 仍登记（用于窗口归属与归还），但**不再参与 y 的计算**
-        val trackIndex = allocateTrack(MAX_TRACKS)
         val window = OverlayWindow(context).apply {
-            this.trackIndex = trackIndex
             gravity = Gravity.TOP or Gravity.START
             xDp = 0f
             this.yDp = yDp
-            // 样式留存：定位式堆叠重排需要（贯穿式已不重排）
+            // 样式留存：定位式堆叠重排需要（贯穿式不重排）
             styleForStack = style
         }
         window.setContent {
@@ -275,13 +286,22 @@ object OverlayController {
                     onMeasuredHeightDp = { h ->
                         mainHandler.post { window.measuredHeightDp = h }
                     },
+                    // V11.8：滚动真正开始时算一次「这条轨什么时候可以再塞一条」——
+                    // 气泡右缘离开屏幕右边留白所需的时间。
+                    onScrollStarted = { bubbleWidthPx, _ ->
+                        mainHandler.post {
+                            val density = context.resources.displayMetrics.density
+                            val gapPx = DANMAKU_REUSE_GAP_DP * density
+                            val speedPx = style.speedPxps.coerceAtLeast(1f)
+                            window.trackReuseAtMs = SystemClock.uptimeMillis() +
+                                (((bubbleWidthPx + gapPx) / speedPx) * 1000f).toLong()
+                        }
+                    },
                 )
             }
         }
         if (!window.attach()) {
             NfLog.w(this, "弹幕窗口挂载失败（权限或系统限制）")
-            // 挂载失败必须归还轨道，否则这个下标永远泄漏、轨道越用越少
-            freeTrack(trackIndex)
             drainQueue()
             return
         }
@@ -290,19 +310,34 @@ object OverlayController {
     }
 
     /**
-     * 找一条「不与任何存活贯穿式弹幕重叠」的 y（dp）；放不下返回 null（调用方排队）。
+     * 给一条贯穿式弹幕选 y（dp）；放不下返回 null（调用方排队）。
      *
-     * 高度优先用**实测值**（`measuredHeightDp`），还没测出来时用估算值。
-     * 从 `topMarginDp` 起逐段跳过已被占用的区间（`y .. y+高度+间距`），
-     * 因此上下顺序永远是「先来的在上」，且新弹幕**绝不会压住前面的**。
+     * 顺序是「先复用、再新开」：
+     * 1. **复用**：同一条 y 上允许多条并存（V11.8）。只要该轨道最新那条的右缘已滚离
+     *    屏幕右侧留白（`trackReuseAtMs` 到点），新的一条从右缘起滚就不会挡住它；
+     * 2. **新开**：没有可复用的，才在下方找一条空轨道（逐段跳过已占区间，
+     *    高度优先用实测值，未测到用估算值）；
+     * 3. 都放不下 → null。
      *
-     * 返回的 y 一旦分配给某条弹幕就**永不改动**——这是修掉「位置突然跳变」的关键：
+     * 返回的 y 一旦分配就**永不改动**——这是修掉「位置突然跳变」的关键：
      * 别人滚完、或者实测高度回报，都不会再触发贯穿式重排。
      */
-    private fun findFreeYDp(context: Context, style: DanmakuStyle, estimatedHDp: Float): Float? {
+    private fun findThroughYDp(context: Context, style: DanmakuStyle, estimatedHDp: Float): Float? {
+        val now = SystemClock.uptimeMillis()
+        val through = danmakuWindows.filter { it.stackSignature == null }
+        // ① 复用：同一条轨道上**可以有多条弹幕同时在滚**（V11.8）。
+        //    判据 = 这条轨道上**最新**那条的右缘已经滚离屏幕右边（`trackReuseAtMs` 已到）。
+        //    此时新的这条从右缘起滚，追不上前面那条，绝不会挡住它。
+        //    这正是「歌词慢一步」的解法：以前一条轨道同时只能有一条，新歌词只能排队，
+        //    等前一条整条滚完（好几秒）才出，看起来永远慢一句。
+        through.groupBy { it.yDp }
+            .entries
+            .filter { (_, ws) -> ws.all { it.trackReuseAtMs <= now } }
+            .minByOrNull { it.key }
+            ?.let { return it.key }
+        // ② 没有可复用的轨道 → 在下方找一条新的空轨道
         val gap = style.trackGapDp
-        val occupied = danmakuWindows
-            .filter { it.stackSignature == null && it.trackIndex >= 0 }
+        val occupied = through
             .map { w -> w.yDp to (w.measuredHeightDp ?: estimatedHDp) }
             .sortedBy { it.first }
         var candidate = style.topMarginDp
@@ -485,10 +520,61 @@ object OverlayController {
         showDanmakuWindow(context, next.first, next.second)
     }
 
-    // ==================== 悬浮 ====================
+    // ==================== 悬浮（V12：多窗口，一规则一窗） ====================
 
+    /**
+     * 预览悬浮的固定 key（规则编辑页预览按钮用；与业务窗口互不干扰）。
+     *
+     * 业务窗口的 key 是规则 id 的字符串形式，预览内容不属于任何规则，故用这个
+     * 不可能与规则 id 冲突的哨兵值独占一个槽位。
+     */
+    const val PREVIEW_FLOAT_KEY = "__preview__"
+
+    /**
+     * 一个悬浮窗口的完整槽位（V12）。
+     *
+     * 与旧「单实例」字段（floatWindow / floatStyle / …）一一对应，只是按 key 存进
+     * [floatSlots] 表：每条规则的悬浮各占一行，互不顶掉。
+     */
+    private class FloatSlot(val key: String) {
+        /** 该 key 当前挂着的窗口；null = 槽位已撤 / 重建中。 */
+        var window: OverlayWindow? = null
+
+        /** 已应用的样式快照；null = 无悬浮 / 刚被清槽。样式变化才重建窗口。 */
+        var style: FloatStyle? = null
+
+        /** 内容状态：写入即重组，不重建窗口。 */
+        var payloadState: MutableState<OverlayPayload>? = null
+
+        /** 内容版本：每次重新显示 +1，驱动「停留 N 秒」重新计时（见 FloatBubble.timerKey）。 */
+        var versionState: MutableState<Int>? = null
+
+        /** 当前内容签名；未变则不写状态（避免进度类通知每秒刷新时无意义重组）。 */
+        var signature: Long = 0L
+
+        /** 常驻悬浮的「最大存活时长」兜底计时（P0-1）；null = 未排 / 已撤销。 */
+        var residentRunnable: Runnable? = null
+    }
+
+    /**
+     * key（规则 id 字符串 / [PREVIEW_FLOAT_KEY]）→ 槽位；**只在主线程访问**。
+     *
+     * LinkedHashMap 的插入序 = 显示序：级联避让（[cascadeYDp]）与「达上限撤最早的」
+     * 都按它算。因此同 key 换样式重建时**不能 remove 再 put**（那会把它挪到队尾、
+     * 级联位置跳变），必须原地清字段（见 [applyFloatShow] 的样式变化分支）。
+     */
+    private val floatSlots = LinkedHashMap<String, FloatSlot>()
+
+    /**
+     * [floatSlots] 键集合的跨线程快照（编排器在协程线程读「窗口还在不在」）。
+     * 每次表结构变动都在主线程经 [syncFloatKeys] 重写；跨线程读取方只拿这份不可变快照，
+     * 绝不直接碰 [floatSlots]。
+     */
     @Volatile
-    private var floatWindow: OverlayWindow? = null
+    private var floatKeySnapshot: Set<String> = emptySet()
+
+    /** 当前活跃的悬浮窗口 key 集合（跨线程安全快照，供 Arbiter 判断窗口是否还在）。 */
+    val floatKeys: Set<String> get() = floatKeySnapshot
 
     // —— V9.3：业务悬浮的「原地换内容」状态 ——
     //
@@ -497,192 +583,308 @@ object OverlayController {
     // 也还是有一下跳变。改成同一样式直接在**同一个窗口里换内容**：ComposeView 不重建、
     // 入场动画不重播、位置不重算，观感就是上一条直接变成新的一条。
     //
-    // 与条件卡片（[conditionalPayloadState]）是同一套手法，但**两个槽位完全独立**。
-
-    /** 当前业务悬浮已应用的样式快照；null = 无悬浮 / 刚被清槽。 */
-    private var floatStyle: FloatStyle? = null
-
-    /** 内容状态：写入即重组，不重建窗口。 */
-    private var floatPayloadState: MutableState<OverlayPayload>? = null
-
-    /** 内容版本：每次重新显示 +1，驱动「停留 N 秒」重新计时（见 FloatBubble.timerKey）。 */
-    private var floatVersionState: MutableState<Int>? = null
-
-    /** 当前内容签名；未变则不写状态（避免进度类通知每秒刷新时无意义重组）。 */
-    private var floatSignature: Long = 0L
+    // V12：这套状态搬进 [FloatSlot]，每条规则一份，于是「A 规则在换内容」完全不会
+    // 碰到 B 规则的窗口。
 
     /**
-     * 常驻悬浮的「最大存活时长」兜底计时器（P0-1）。
+     * 显示（或替换）某个 key 的悬浮卡片（V12：一规则一窗）。
      *
-     * 为什么需要：`displaySeconds <= 0` 的常驻悬浮窗口带 `FLAG_NOT_TOUCHABLE`
-     * （点击穿透，点不中）且没有通知栏入口，[dismissFloat] 在 V6.0 里**没有任何调用者**——
-     * 一旦挂上就永久留在屏幕上，用户没有办法关掉。故对常驻实例设 30 分钟上限。
+     * 语义（与旧单实例版一致，只是按 key 各管各的）：
+     * - 同 key + 同样式 → **原地换内容**（不重建窗口、不重播动画，V9.3）；
+     * - 同 key + 样式变了 → 硬摘旧窗口、**原位**重建（新内容优先，V8 替换语义；
+     *   原位 = 槽位对象留在 [floatSlots] 原处，级联顺序不变）；
+     * - 新 key → 新开槽位；同屏达 [MAX_FLOAT_WINDOWS] 时先撤最早的（插入序第一个）。
      *
-     * 撤销点（三处，缺一处就会出现「旧计时关掉新窗口」）：
-     * 1. [showFloat] 开头 —— 新悬浮覆盖旧的；
-     * 2. [dismissFloat] —— 主动撤下；
-     * 3. [dismissAll] —— 全清（与 1 配合，保证全清后残留计时不会命中后来者）。
-     */
-    private val residentDismissTask = Runnable {
-        NfLog.d(OverlayController, "常驻悬浮达到最大存活时长，自动撤下")
-        dismissFloat()
-    }
-
-    /**
-     * 显示（或替换）悬浮卡片。
+     * @param key 悬浮归属：规则 id 的字符串形式，或 [PREVIEW_FLOAT_KEY]
      * @return 是否已显示；false 表示无权限 / 未初始化。
      */
-    fun showFloat(payload: OverlayPayload, style: FloatStyle): Boolean {
+    fun showFloat(key: String, payload: OverlayPayload, style: FloatStyle): Boolean {
         val context = appContext
         if (context == null || !canDrawOverlays()) return false
-        mainHandler.post {
-            // P0-1：替换旧悬浮时必须撤销旧的「常驻最大存活」计时，否则旧计时会在
-            // **新窗口**上提前触发（同一个 MessageQueue 上的延迟消息不会因为窗口被
-            // detach 而失效），表现为「新悬浮刚出来几秒就自己没了」。
-            mainHandler.removeCallbacks(residentDismissTask)
-            // —— V9.3：同一样式 → 原地换内容（无缝衔接上一次悬浮）——
-            //
-            // 注意 `isExitRequested`：上一次正在播退场动画时不能复用（它马上就没了），
-            // 必须重建窗口（旧窗口硬摘，新内容优先，与 V8 的替换语义一致）。
-            val current = floatWindow
-            if (current != null && floatStyle == style && !current.isExitRequested) {
-                applyFloatContent(payload)
-                if (style.displaySeconds <= 0f) {
-                    // 常驻实例的 30 分钟兜底重新排（旧计时已在上面撤销）
-                    mainHandler.postDelayed(residentDismissTask, MAX_FLOAT_RESIDENT_MS)
-                }
-                return@post
-            }
-            // V8：替换旧悬浮用 detachNow —— 顺手撤销旧窗口可能还挂着的退场超时任务
-            // （否则旧窗口的超时延迟消息会命中**新窗口**所在的槽位）。
-            // 新内容要立刻上场，故替换路径**不等**旧窗口的退场动画（旧窗口直接硬摘）。
-            current?.let { detachNow(it) }
-            floatWindow = null
-            clearFloatSlot()
-
-            val payloadState = mutableStateOf(payload)
-            val versionState = mutableStateOf(0)
-            // 出现动画 =「无」→ 冻结 animKey：内容热更新时**不重播**任何入场（用户要的
-            // 「无缝」）；其余动画则用版本号当 key，让新内容也有一次入场，而不是硬跳变。
-            val replayEntranceOnUpdate = style.animEnum != OverlayAnim.NONE
-            val window = OverlayWindow(context).apply {
-                gravity = gravityOf(style.screenAlignEnum)
-                // V9：退场超时跟着用户配的消失时长走（+60ms 容差，下限 120ms）
-                exitWaitMs = (style.animOutMs + 60).coerceAtLeast(120).toLong()
-                // D3：垂直偏移只在这里生效（FloatBubble 不再重复 padding(top)）。
-                // 停靠 TOP 时为「距顶部」，停靠 BOTTOM 时为「距底部」——都是相对停靠边。
-                yDp = style.offsetTopDp
-                // 水平偏移交给 FloatBubble 的 start/end 内边距（窗口是 MATCH_PARENT 宽，
-                // 在窗口层再设 x 会与内边距叠加成双倍偏移）。
-                xDp = 0f
-            }
-            window.setContent {
-                NotificationFilterTheme {
-                    FloatBubble(
-                        payload = payloadState.value,
-                        style = style,
-                        // V8：把窗口的退场信号交给渲染层 —— 于是 dismissFloat() 不再是
-                        // 「啪一下消失」，而是先按 animOut 播退场、播完回调这里。
-                        exitSignal = window.exitSignal,
-                        onFinished = {
-                            mainHandler.post {
-                                // P1-4：只摘自己。本回调与 showFloat（管线线程）
-                                // 都会 post 到同一个 MessageQueue，跨线程投递顺序不保证：
-                                // 此刻 floatWindow 可能**已经是新窗口**，无条件 detach
-                                // 会把新悬浮闪一下就摘掉（预览路径早已按此写法修正）。
-                                if (floatWindow == window) {
-                                    floatWindow = null
-                                    clearFloatSlot()
-                                }
-                                detachNow(window)
-                            }
-                        },
-                        // V9.3：animKey 管动画、timerKey 管计时（见 FloatBubble 参数说明）
-                        animKey = if (replayEntranceOnUpdate) versionState.value else 0,
-                        timerKey = versionState.value,
-                    )
-                }
-            }
-            if (window.attach()) {
-                floatWindow = window
-                floatStyle = style
-                floatPayloadState = payloadState
-                floatVersionState = versionState
-                floatSignature = signatureOf(payload)
-                // P0-1：displaySeconds <= 0 = 常驻。常驻窗口带 FLAG_NOT_TOUCHABLE
-                // （点不中）且没有通知栏入口，若不设上限就会**永久挂在屏幕上**。
-                // 这里给 30 分钟的兜底存活时长，用户另有「首页菜单 → 清除屏幕显示」可随时撤。
-                // 预览实例（showFloatPreview）**不走这条路径**，由配置页的 DisposableEffect 管。
-                if (style.displaySeconds <= 0f) {
-                    mainHandler.postDelayed(residentDismissTask, MAX_FLOAT_RESIDENT_MS)
-                }
-            } else {
-                NfLog.w(this, "悬浮窗口挂载失败（权限或系统限制）")
-            }
-        }
+        mainHandler.post { applyFloatShow(context, key, payload, style) }
         return true
     }
 
     /**
-     * 原地更新业务悬浮的内容（V9.3，**只在主线程**调用）。
+     * 原地刷新某个 key 的悬浮内容（V12；主线程执行）。
+     *
+     * key 不在表里（用户刚清屏 / 已自动消失）就**什么都不做**——
+     * 绝不让「后台来了一条聚合条目」把用户刚清掉的悬浮重新拉起来。
+     */
+    fun updateFloat(key: String, payload: OverlayPayload) {
+        // 快路径：跨线程只读快照，绝大多数调用（窗口不在）在这里就返回，不投递主线程消息
+        if (key !in floatKeySnapshot) return
+        mainHandler.post {
+            if (key !in floatSlots) return@post
+            applyFloatContent(key, payload)
+        }
+    }
+
+    /**
+     * 撤下悬浮（**先播退场动画，再摘窗口**）。
+     *
+     * V8 时序（这是需求「悬浮消失也能配动画」的落地点）：
+     * 1. 撤销该 key 的常驻兜底计时（P0-1）；
+     * 2. 槽位**立刻出表**（退场期间到达的新 showFloat 不会往这张消失的窗口里写内容，
+     *    也不会被这次退场回调误摘——onFinished 里按 `window` 身份校验）；
+     * 3. `requestExit(window)` → 渲染层播 [FloatStyle.animOut] 的退场动画；
+     * 4. 气泡播完回调 `onFinished()` → `detachNow`；超时兜底走同一条收尾。
+     *
+     * **幂等**：重复调用时 `markExitRequested()` 直接拦住，不会播两次、不会摘两次。
+     *
+     * @param key null = 全部撤下；非 null = 只撤该 key
+     */
+    fun dismissFloat(key: String? = null) {
+        mainHandler.post {
+            val targets: List<FloatSlot>
+            if (key == null) {
+                targets = floatSlots.values.toList()
+                floatSlots.clear()
+                syncFloatKeys()
+            } else {
+                val slot = floatSlots.remove(key)
+                targets = if (slot == null) emptyList() else listOf(slot)
+                if (slot != null) syncFloatKeys()
+            }
+            targets.forEach { slot ->
+                // P0-1：撤悬浮必须同步撤销常驻计时（否则计时器留到下一次悬浮上触发）
+                slot.residentRunnable?.let { mainHandler.removeCallbacks(it) }
+                slot.residentRunnable = null
+                slot.window?.let { requestExit(it) { detachNow(it) } }
+            }
+            // 撤掉一个后，同组后面的窗口按新顺序顶上（原位移动，不重建、不重播动画）
+            recomputeCascades()
+        }
+    }
+
+    /**
+     * 悬浮窗口的实际挂载 / 替换（**只在主线程**调用）。
+     *
+     * @param key 悬浮归属（见 [showFloat]）
+     */
+    private fun applyFloatShow(
+        context: Context,
+        key: String,
+        payload: OverlayPayload,
+        style: FloatStyle,
+    ) {
+        // —— V9.3：同 key 同样式 → 原地换内容（无缝衔接上一次悬浮）——
+        //
+        // 注意 `isExitRequested`：正在播退场动画的窗口马上就要没了，不能复用，
+        // 必须重建窗口（旧窗口硬摘，新内容优先，与 V8 的替换语义一致）。
+        val existing = floatSlots[key]
+        if (existing != null && existing.style == style &&
+            existing.window?.isExitRequested == false
+        ) {
+            applyFloatContent(key, payload)
+            scheduleResidentDismiss(existing, style)
+            return
+        }
+
+        // 同屏窗口数达安全上限：撤最早的（插入序第一个），防止规则轰炸挂出几十个窗口
+        if (existing == null && floatSlots.size >= MAX_FLOAT_WINDOWS) {
+            val oldestKey = floatSlots.keys.first()
+            floatSlots.remove(oldestKey)?.let { oldest ->
+                oldest.residentRunnable?.let { mainHandler.removeCallbacks(it) }
+                oldest.window?.let { detachNow(it) }
+            }
+            syncFloatKeys()
+            NfLog.d(this, "悬浮窗口达上限 $MAX_FLOAT_WINDOWS，撤下最早的 key=$oldestKey")
+        }
+
+        // V8：样式变化（同 key 换样式）一律硬摘旧窗口（新内容要立即上场，不等旧窗退场），
+        // 但仍走 detachNow 以撤销旧窗口可能残留的退场超时任务。
+        // 槽位对象**保留在 map 原位**（LinkedHashMap put 已存在 key 不改顺序），
+        // 只把窗口与状态字段清空待重建——级联避让的相对位置因此不变。
+        existing?.let { slot ->
+            slot.residentRunnable?.let { mainHandler.removeCallbacks(it) }
+            slot.residentRunnable = null
+            slot.window?.let { detachNow(it) }
+            slot.window = null
+            slot.style = null
+            slot.payloadState = null
+            slot.versionState = null
+            slot.signature = 0L
+        }
+        val slot = existing ?: FloatSlot(key).also {
+            floatSlots[key] = it
+            syncFloatKeys()
+        }
+
+        val payloadState = mutableStateOf(payload)
+        val versionState = mutableStateOf(0)
+        // 出现动画 =「无」→ 冻结 animKey：内容热更新时**不重播**任何入场（用户要的
+        // 「无缝」）；其余动画则用版本号当 key，让新内容也有一次入场，而不是硬跳变。
+        val replayEntranceOnUpdate = style.animEnum != OverlayAnim.NONE
+        val window = OverlayWindow(context).apply {
+            gravity = gravityOf(style.screenAlignEnum)
+            // V9：退场超时跟着用户配的消失时长走（+60ms 容差，下限 120ms）
+            exitWaitMs = (style.animOutMs + 60).coerceAtLeast(120).toLong()
+            // D3：垂直偏移只在这里生效（FloatBubble 不再重复 padding(top)）。
+            // 停靠 TOP 时为「距顶部」，停靠 BOTTOM 时为「距底部」——都是相对停靠边。
+            // V12：同停靠位 + 同偏移的多个窗口按显示顺序级联避让，防止完全重叠。
+            yDp = cascadeYDp(key, style)
+            // 水平偏移交给 FloatBubble 的 start/end 内边距（窗口是 MATCH_PARENT 宽，
+            // 在窗口层再设 x 会与内边距叠加成双倍偏移）。
+            xDp = 0f
+        }
+        window.setContent {
+            NotificationFilterTheme {
+                FloatBubble(
+                    payload = payloadState.value,
+                    style = style,
+                    // V8：把窗口的退场信号交给渲染层 —— 于是 dismissFloat() 不再是
+                    // 「啪一下消失」，而是先按 animOut 播退场、播完回调这里。
+                    exitSignal = window.exitSignal,
+                    onFinished = {
+                        mainHandler.post {
+                            // P1-4：只摘自己。本回调与 showFloat（管线线程）
+                            // 都会 post 到同一个 MessageQueue，跨线程投递顺序不保证：
+                            // 此刻同 key 的槽位可能**已经是新窗口**，无条件清槽 / detach
+                            // 会把新悬浮闪一下就摘掉（预览路径早已按此写法修正）。
+                            if (floatSlots[key]?.window === window) {
+                                discardFloatSlot(key)
+                            }
+                            detachNow(window)
+                        }
+                    },
+                    // V9.3：animKey 管动画、timerKey 管计时（见 FloatBubble 参数说明）
+                    animKey = if (replayEntranceOnUpdate) versionState.value else 0,
+                    timerKey = versionState.value,
+                )
+            }
+        }
+        if (window.attach()) {
+            slot.window = window
+            slot.style = style
+            slot.payloadState = payloadState
+            slot.versionState = versionState
+            slot.signature = signatureOf(payload)
+            // P0-1：displaySeconds <= 0 = 常驻。常驻窗口带 FLAG_NOT_TOUCHABLE
+            // （点不中）且没有通知栏入口，若不设上限就会**永久挂在屏幕上**。
+            // 这里给 30 分钟的兜底存活时长，用户另有「首页菜单 → 清除屏幕显示」可随时撤。
+            // 预览实例（showFloatPreview）**不走这条路径**，由配置页的 DisposableEffect 管。
+            scheduleResidentDismiss(slot, style)
+            recomputeCascades()
+        } else {
+            NfLog.w(this, "悬浮窗口挂载失败（权限或系统限制）key=$key")
+            discardFloatSlot(key)
+        }
+    }
+
+    /**
+     * 原地更新某个 key 的悬浮内容（**只在主线程**调用）。
      *
      * 内容没变也照样 +版本号：语义是「这条又命中了一次」，停留 N 秒要重新开始计。
      * 内容变了才写状态（避免进度类通知每秒刷新时的无意义重组）。
      */
-    private fun applyFloatContent(payload: OverlayPayload) {
-        val state = floatPayloadState ?: return
-        val version = floatVersionState ?: return
+    private fun applyFloatContent(key: String, payload: OverlayPayload) {
+        val slot = floatSlots[key] ?: return
+        val state = slot.payloadState ?: return
+        val version = slot.versionState ?: return
         val signature = signatureOf(payload)
-        if (signature != floatSignature) {
-            floatSignature = signature
+        if (signature != slot.signature) {
+            slot.signature = signature
             state.value = payload
         }
         version.value += 1
     }
 
-    /** 只清槽位字段、**不动窗口**（窗口的摘除由调用方决定）。 */
-    private fun clearFloatSlot() {
-        floatStyle = null
-        floatPayloadState = null
-        floatVersionState = null
-        floatSignature = 0L
+    /**
+     * 撤表 + 取消该槽常驻计时 + 刷新快照与级联（**不动窗口**，窗口由调用方 detach）。
+     *
+     * 调用点：[applyFloatShow] 挂载失败、FloatBubble 的 `onFinished`（退场播完）。
+     */
+    private fun discardFloatSlot(key: String) {
+        val slot = floatSlots.remove(key) ?: return
+        slot.residentRunnable?.let { mainHandler.removeCallbacks(it) }
+        slot.residentRunnable = null
+        syncFloatKeys()
+        recomputeCascades()
+    }
+
+    /** 把 [floatSlots] 的键集合写成跨线程快照（**只在主线程**调用）。 */
+    private fun syncFloatKeys() {
+        floatKeySnapshot = LinkedHashSet(floatSlots.keys)
     }
 
     /**
-     * 撤下当前悬浮（**先播退场动画，再摘窗口**）。
+     * 常驻悬浮的「最大存活时长」兜底计时（P0-1，V12 起每槽一份）。
      *
-     * V8 时序（这是需求「悬浮消失也能配动画」的落地点）：
-     * 1. 撤销常驻兜底计时（P0-1）；
-     * 2. `requestExit(window)` → 渲染层播 [FloatStyle.animOut] 的退场动画（240ms）；
-     * 3. 气泡播完回调 `onFinished()` → 清槽位 + `detachNow`；
-     * 4. 万一 300ms 内没等到回调 → 超时任务强制走同一条收尾（窗口绝不会留在屏幕上）。
+     * 为什么需要：`displaySeconds <= 0` 的常驻悬浮窗口带 `FLAG_NOT_TOUCHABLE`
+     * （点击穿透，点不中）且没有通知栏入口——一旦挂上就可能永久留在屏幕上，
+     * 用户只能靠「清除屏幕显示」关掉。故对常驻实例设 30 分钟上限。
      *
-     * **幂等**：重复调用时 `markExitRequested()` 直接拦住，不会播两次、不会摘两次。
-     * 注意：退场期间 [floatWindow] **仍然指向该窗口**（它还在屏幕上），
-     * 因此新悬浮到来时 `showFloat` 会把它硬摘替换掉——语义是「新内容优先」。
+     * 撤销点（缺一处就会出现「旧计时关掉新窗口」）：同 key 原地换内容 /
+     * 换样式重建（[applyFloatShow]）、撤下（[dismissFloat] / [discardFloatSlot]）、
+     * 全清（[dismissAll]）——全部经本方法取消旧计时后再按需重排。
      */
-    fun dismissFloat() {
-        mainHandler.post {
-            // P0-1：撤悬浮必须同步撤销常驻计时（否则计时器留到下一次悬浮上触发）
-            mainHandler.removeCallbacks(residentDismissTask)
-            val window = floatWindow ?: return@post
-            requestExit(window) {
-                // 只清自己：退场期间槽位可能已被新悬浮接管
-                if (floatWindow === window) {
-                    floatWindow = null
-                    // V9.3：内容状态一并清掉，否则下一次 showFloat 会往死掉的窗口里写内容
-                    clearFloatSlot()
-                }
-                detachNow(window)
+    private fun scheduleResidentDismiss(slot: FloatSlot, style: FloatStyle) {
+        slot.residentRunnable?.let { mainHandler.removeCallbacks(it) }
+        slot.residentRunnable = null
+        // displaySeconds > 0 = 到点自行消失，不需要常驻兜底
+        if (style.displaySeconds > 0f) return
+        val runnable = Runnable {
+            NfLog.d(this, "常驻悬浮达到最大存活时长，自动撤下 key=${slot.key}")
+            dismissFloat(slot.key)
+        }
+        slot.residentRunnable = runnable
+        mainHandler.postDelayed(runnable, MAX_FLOAT_RESIDENT_MS)
+    }
+
+    /**
+     * 同停靠位多窗口的级联避让 y（dp，V12）。
+     *
+     * 防的是「多条规则都配了默认位置（TOP_END + 120dp）」时多个窗口**完全重叠**：
+     * 数「表中排在 [key] 之前、同组（[FloatStyle.screenAlignEnum] 与
+     * [FloatStyle.offsetTopDp] 都相同）」的槽位数 i，按 i 逐步偏移——
+     * BOTTOM 系停靠向上避让（`offsetTopDp - i×step`，否则会越避让越出屏幕），
+     * 其余向下（`offsetTopDp + i×step`）。
+     *
+     * 对**已在表中**的 key（换样式重建）只数排在它前面的，相对位置保持不变。
+     */
+    private fun cascadeYDp(key: String, style: FloatStyle): Float {
+        var index = 0
+        for (existingKey in floatSlots.keys) {
+            if (existingKey == key) break
+            val other = floatSlots[existingKey]?.style ?: continue
+            if (other.screenAlignEnum == style.screenAlignEnum &&
+                other.offsetTopDp == style.offsetTopDp
+            ) {
+                index++
             }
+        }
+        val step = index * FLOAT_CASCADE_STEP_DP
+        return when (style.screenAlignEnum) {
+            OverlayAlign.BOTTOM_START,
+            OverlayAlign.BOTTOM_CENTER,
+            OverlayAlign.BOTTOM_END,
+            -> style.offsetTopDp - step
+
+            else -> style.offsetTopDp + step
+        }
+    }
+
+    /**
+     * 表中槽位增减后重算级联避让位置（**只在主线程**调用）。
+     *
+     * 只对**位置真的变了**的窗口发 `updateViewLayout`（[OverlayWindow.updatePosition]
+     * 内部有判重），原位移动、不重建 Compose 内容，不重播动画、不打断停留计时。
+     */
+    private fun recomputeCascades() {
+        if (floatSlots.size <= 1) return
+        for ((key, slot) in floatSlots) {
+            val style = slot.style ?: continue
+            val window = slot.window ?: continue
+            window.updatePosition(0f, cascadeYDp(key, style))
         }
     }
 
     // ==================== 悬浮真机预览（V5 需求④） ====================
 
     /**
-     * 悬浮预览的**独立实例**：与业务悬浮 [floatWindow] 互不干扰——配置对话框开着时
-     * 一条真实通知来了仍走 floatWindow，预览参数刷新也不会顶掉它。
+     * 悬浮预览的**独立实例**：与业务悬浮（[floatSlots] 里的窗口）互不干扰——配置对话框
+     * 开着时一条真实通知来了仍走业务窗口，预览参数刷新也不会顶掉它。
      */
     @Volatile
     private var floatPreviewWindow: OverlayWindow? = null
@@ -756,222 +958,6 @@ object OverlayController {
         }
     }
 
-    // ==================== 条件卡片（V7 需求 7 / 8） ====================
-
-    /**
-     * 条件卡片的**单实例槽位**：与业务悬浮 [floatWindow] **完全独立**。
-     *
-     * 为什么要独立：条件卡片由 `OverlayConditionArbiter` 按条件驱动、可能常驻很久；
-     * 业务悬浮是「一条命中一次」的短时展示。若共用一个槽位，一条新命中的普通悬浮
-     * 就会把正在显示的条件汇总卡片顶掉（用户最关心的功能被无关通知打断）。
-     */
-    @Volatile
-    private var conditionalFloatWindow: OverlayWindow? = null
-
-    /** 当前条件卡片的 key（= 规则 id 的字符串形式）；null = 当前无卡片。 */
-    @Volatile
-    private var conditionalKey: String? = null
-
-    /**
-     * 当前条件卡片**已应用**的样式快照。
-     *
-     * 用途：样式（限高 / 可滚动 / 停靠位置 / 可触摸）变化时窗口布局参数必须重建
-     * （`WRAP_CONTENT` 与 `FLAG_NOT_TOUCHABLE` 都是 attach 时一次性写入 LayoutParams 的）。
-     * 只有「同 key 且同样式」才走原地换内容，否则重建——避免用户改了卡片高度却看不到变化。
-     */
-    @Volatile
-    private var conditionalStyle: FloatStyle? = null
-
-    /**
-     * 条件卡片的内容状态：**内容原地更新靠改这个 MutableState**，不重建窗口
-     * （架构 §3.4 红线 4：不重播入场动画、不 reset 停留计时）。
-     */
-    @Volatile
-    private var conditionalPayloadState: MutableState<OverlayPayload>? = null
-
-    /**
-     * 已渲染内容的签名（标题 + 正文的 64 位指纹）。
-     *
-     * 重绘前先比对：**未变则不写状态**。这是「进度类通知每秒刷新」「同一批聚合条目重复
-     * 触发」时避免无意义重组的关键保护；同时它也被冻结成 [FloatBubble] 的 `animKey`，
-     * 于是同一张卡片的内容更新不会重播入场动画。
-     */
-    @Volatile
-    private var conditionalSignature: Long = 0L
-
-    /** 当前条件卡片的 key（供 Arbiter / 自检读取；null = 无卡片）。 */
-    val conditionalFloatKey: String? get() = conditionalKey
-
-    /**
-     * 显示 / 替换条件卡片（V7 需求 7 + 8）。
-     *
-     * **幂等语义**（调用方可以无脑重复调用）：
-     * - 传入的 [key] 与当前卡片相同 → **原地换内容**（不重建窗口、不重播动画、不 reset 计时）；
-     * - [key] 不同（或当前无卡片）→ 撤下旧卡、重建新卡（新规则替换旧规则，与既有悬浮替换路径一致）。
-     *
-     * 窗口差异（相对普通悬浮，见 `OverlayWindow.attach()`）：
-     * - [FloatStyle.touchable] = true 时：宽度 `WRAP_CONTENT`（最大屏宽 85%，由渲染层约束）、
-     *   **去掉 `FLAG_NOT_TOUCHABLE`**（卡片内可手指滚动），水平停靠改由 gravity + `params.x` 完成；
-     * - 高度恒 `WRAP_CONTENT`；内容区限高 [FloatStyle.maxHeightDp]，可滚动见 `contentScrollable`；
-     * - **不加 30 分钟常驻上限**：条件卡片的消失由条件驱动，不由计时驱动。
-     *
-     * @param key 规则 id（字符串形式）；同 key 视为同一张卡片
-     * @param payload 卡片内容（已渲染好的标题 / 正文）
-     * @param style 卡片样式（`touchable` 由调用方按功能推导后写入）
-     * @return true = 已投递显示；false = 无悬浮窗权限 / 未初始化（调用方应记为跳过）
-     */
-    fun showConditionalFloat(key: String, payload: OverlayPayload, style: FloatStyle): Boolean {
-        val context = appContext ?: return false
-        if (!canDrawOverlays()) return false
-        mainHandler.post { applyConditionalCard(context, key, payload, style) }
-        return true
-    }
-
-    /**
-     * 仅更新内容（聚合列表变化 / 同规则新内容）：不重建窗口、不重播动画、不 reset 计时。
-     *
-     * key 不匹配（当前卡片属于别的规则 / 已无卡片）时**什么都不做**——
-     * 避免「旧条件的更新把新卡片改掉」。
-     */
-    fun updateConditionalFloat(key: String, payload: OverlayPayload) {
-        // 快路径：绝大多数调用（非当前卡片的规则）在这里就返回，不投递主线程消息
-        if (conditionalKey != key) return
-        mainHandler.post { applyConditionalPayload(key, payload) }
-    }
-
-    /**
-     * 撤下条件卡片。
-     *
-     * @param key null = 无条件撤下（全清 / 卸载 / 索引清空）；非 null = 只撤「key 匹配」的那张
-     *   （旧条件的 HIDE 不能关掉新卡片，架构 §3.9 的防串台口径在此落地）。
-     */
-    fun dismissConditionalFloat(key: String? = null) {
-        mainHandler.post {
-            if (key != null && conditionalKey != key) return@post
-            val window = conditionalFloatWindow
-            if (window == null) {
-                // 槽位已空（可能上一张卡片正在退场）→ 只清残留字段，别把空槽变脏
-                clearConditionalSlot()
-                return@post
-            }
-            // V8：先让出槽位，再播退场。
-            //
-            // 顺序很重要：槽位立刻清空 → 退场期间到达的 `updateConditionalFloat` /
-            // 新 `showConditionalFloat` 不会再往这张正在消失的卡片里写内容；
-            // 窗口本身仍由 requestExit 持有，播完（或超时）才 detachNow。
-            clearConditionalSlot()
-            requestExit(window) { detachNow(window) }
-        }
-    }
-
-    /** 条件卡片的实际挂载（**只在主线程**调用）。 */
-    private fun applyConditionalCard(
-        context: Context,
-        key: String,
-        payload: OverlayPayload,
-        style: FloatStyle,
-    ) {
-        val existing = conditionalFloatWindow
-        if (existing != null && conditionalKey == key && conditionalStyle == style) {
-            // 同规则 + 同样式 → 原地换内容（这是「聚合条目新增时不动画重播」的落地点）
-            applyConditionalPayload(key, payload)
-            return
-        }
-
-        // V8：替换 / 重建一律硬摘旧窗口（新卡片要立即上场，不等旧卡退场），
-        // 但仍走 detachNow 以撤销旧窗口可能残留的退场超时任务。
-        existing?.let { detachNow(it) }
-        clearConditionalSlot()
-
-        val state = mutableStateOf(payload)
-        // 冻结入场动画 key：同一张卡片后续内容变化不会改变它 → 不重播动画；
-        // 新卡片（新窗口 = 新 composition）本来就会播一次，无需 key 变化驱动。
-        val animKey = signatureOf(payload)
-        // 注意：局部变量不能与 OverlayWindow.touchable 同名——apply{} 内的隐式接收者
-        // 优先级高于外层局部变量，`this.touchable = touchable` 会自我赋值
-        val isTouchable = style.touchable
-        val window = OverlayWindow(context).apply {
-            this.touchable = isTouchable
-            gravity = gravityOf(style.screenAlignEnum)
-            // V9：条件卡片的退场超时同样跟着 animOutMs 走
-            exitWaitMs = (style.animOutMs + 60).coerceAtLeast(120).toLong()
-            // 垂直偏移仍由 params.y 承担（与 V6 口径一致，渲染层不再加 padding(top)）
-            yDp = style.offsetTopDp
-            // 不可触摸（宽度 MATCH_PARENT）时水平位置由渲染层的 start/end 内边距负责，
-            // 窗口层再设 x 会叠加成双倍偏移；可触摸（WRAP_CONTENT）时才靠 params.x 落位。
-            xDp = if (isTouchable) style.offsetEndDp else 0f
-        }
-        window.setContent {
-            NotificationFilterTheme {
-                FloatBubble(
-                    payload = state.value,
-                    style = style,
-                    // V8：条件卡片的撤下（dismissConditionalFloat）同样先播退场再摘窗口
-                    exitSignal = window.exitSignal,
-                    onFinished = {
-                        mainHandler.post {
-                            // 只摘自己：跨线程投递顺序不保证，此刻槽位可能已是新卡片
-                            if (conditionalFloatWindow === window) {
-                                clearConditionalSlot()
-                            }
-                            detachNow(window)
-                        }
-                    },
-                    // 条件卡片**不自动消失**：它的生命周期由条件驱动（V7 需求 7），
-                    // 停留秒数对它是无意义的配置
-                    autoDismiss = false,
-                    // 可触摸窗口是 WRAP_CONTENT：渲染层不能 fillMaxWidth / 不能加 side padding
-                    fillWidth = !isTouchable,
-                    maxHeightDp = style.maxHeightDp,
-                    scrollable = style.contentScrollable,
-                    animKey = animKey,
-                )
-            }
-        }
-        if (window.attach()) {
-            conditionalFloatWindow = window
-            conditionalKey = key
-            conditionalStyle = style
-            conditionalPayloadState = state
-            conditionalSignature = animKey
-            NfLog.d(this, "条件卡片已显示 key=$key touchable=$isTouchable")
-        } else {
-            NfLog.w(this, "条件卡片挂载失败（权限或系统限制）")
-        }
-    }
-
-    /** 原地更新内容（**只在主线程**调用）：内容未变则不写状态，避免无意义重组。 */
-    private fun applyConditionalPayload(key: String, payload: OverlayPayload) {
-        if (conditionalKey != key) return
-        val state = conditionalPayloadState ?: return
-        val signature = signatureOf(payload)
-        if (signature == conditionalSignature) return
-        conditionalSignature = signature
-        state.value = payload
-    }
-
-    /**
-     * 只清槽位字段、**不动窗口**（V8）。
-     *
-     * 用于「窗口还在播退场动画、但槽位必须立刻让出来」的两种场景：
-     * [dismissConditionalFloat] 与 [applyConditionalCard] 的替换路径。
-     * 窗口的实际摘除由调用方交给 [requestExit]（退场后）或 [detachNow]（立即替换）。
-     */
-    private fun clearConditionalSlot() {
-        conditionalFloatWindow = null
-        conditionalPayloadState = null
-        conditionalKey = null
-        conditionalStyle = null
-        conditionalSignature = 0L
-    }
-
-    /** 清空条件卡片槽位并**立刻**摘掉窗口（**只在主线程**调用）。 */
-    private fun clearConditionalCard() {
-        val window = conditionalFloatWindow
-        clearConditionalSlot()
-        window?.let { detachNow(it) }
-    }
-
     /**
      * 内容签名（标题 + 正文的 64 位指纹）。
      *
@@ -980,7 +966,6 @@ object OverlayController {
      */
     private fun signatureOf(payload: OverlayPayload): Long =
         NotificationFingerprint.of(payload.title, payload.text, emptyList())
-
 
     // ==================== 全清 ====================
 
@@ -1001,18 +986,19 @@ object OverlayController {
             danmakuQueue.clear()
             // 轨道占用集合必须一起清空，否则下一轮弹幕永远拿不到 0 号轨
             occupiedTracks.clear()
-            // P0-1：常驻悬浮的兜底计时一并撤销（全清之后不该再有延迟消息去动悬浮窗）
-            mainHandler.removeCallbacks(residentDismissTask)
-            // 悬浮：可能正处在退场动画中（槽位已清但窗口还在），这里一并硬摘
-            floatWindow?.let { detachNow(it) }
-            floatWindow = null
-            clearFloatSlot()
+            // P0-1：每个悬浮窗口的常驻兜底计时一并撤销（全清之后不该再有延迟消息去动悬浮窗）
+            floatSlots.values.toList().forEach { slot ->
+                slot.residentRunnable?.let { mainHandler.removeCallbacks(it) }
+                slot.residentRunnable = null
+                // 悬浮：可能正处在退场动画中（槽位已清但窗口还在），这里一并硬摘
+                slot.window?.let { detachNow(it) }
+            }
+            floatSlots.clear()
+            syncFloatKeys()
             // 配置对话框的悬浮预览一并撤掉（否则服务断连后预览残留在屏幕上）
             floatPreviewWindow?.let { detachNow(it) }
             floatPreviewWindow = null
-            // V7：条件卡片也在「清除屏幕显示」的范围内（首页菜单无需改动即可清掉它）
-            clearConditionalCard()
-            // V8：槽位已让出、正在播退场的窗口（悬浮 / 条件卡片）不在任何槽位里，
+            // V8：槽位已让出、正在播退场的窗口（悬浮）不在任何槽位里，
             // 必须靠这张登记表逐个硬摘，否则它们会残留到超时兜底才消失。
             // 用 toList() 拷贝：detachNow 内部会修改 exitingWindows。
             exitingWindows.toList().forEach { detachNow(it) }
@@ -1086,7 +1072,8 @@ object OverlayController {
         var exitWaitMs: Long = EXIT_TIMEOUT_MS
 
         /**
-         * 窗口是否可触摸（V7 需求 8，**仅条件卡片可能为 true**）。
+         * 窗口是否可触摸（V7 需求 8 引入；V12 起条件卡片整段删除，当前所有悬浮窗口
+         * 恒 false = 点击穿透，机制保留给将来可能的可触摸悬浮）。
          *
          * 为 false 时保持 V6 语义：宽度 `MATCH_PARENT` + `FLAG_NOT_TOUCHABLE`（点击穿透）。
          * 为 true 时宽度改 `WRAP_CONTENT` 且去掉 `FLAG_NOT_TOUCHABLE`——
@@ -1119,6 +1106,14 @@ object OverlayController {
          * 堆叠/轨道排布按实测高度累计（估算常量只在未回报前兜底）。
          */
         var measuredHeightDp: Float? = null
+
+        /**
+         * 贯穿式弹幕：这条轨道**什么时候可以再塞一条**（uptimeMillis，V11.8）。
+         *
+         * 由渲染层在滚动真正开始时按「气泡宽 + 右缘留白」÷ 速度算出并回填；
+         * 默认 [Long.MAX_VALUE] = 还没开始滚，绝不复用（保守，避免重叠）。
+         */
+        var trackReuseAtMs: Long = Long.MAX_VALUE
 
         // —— V8：退场编排（先播退场、再摘窗口）——
 
@@ -1349,6 +1344,25 @@ object OverlayController {
 
 }
 
+/**
+ * 同屏悬浮窗口上限（V12 安全阀）。
+ *
+ * 用户要求「不同规则的悬浮窗能够同时存在」，因此不再有「一条顶一条」的天然限流；
+ * 但每个窗口都是一个全宽 Window + 独立 ComposeView/Recomposer/Surface，必须留一个
+ * 防失控的硬顶。8 条远超实际观感需求（通常同时可见的规则悬浮也就 2~4 条），
+ * 达上限时撤下**最早显示**的那个（[OverlayController.floatSlots] 插入序第一个）。
+ */
+private const val MAX_FLOAT_WINDOWS = 8
+
+/**
+ * 同停靠位多窗口级联避让的步进（dp，V12）。
+ *
+ * 多条规则都配了默认位置（同 [com.local.notificationfilter.core.model.OverlayAlign] +
+ * 同 offsetTopDp）时，第 i 个窗口相对基准偏移 i×本值，肉眼可辨、不会完全重叠。
+ * 14dp ≈ 一个紧凑行高的一半，错开明显又不至于把卡片推出屏幕。
+ */
+private const val FLOAT_CASCADE_STEP_DP = 14f
+
 /** 排队上限（超出丢最旧，防通知轰炸把队列撑爆）。 */
 private const val MAX_QUEUE = 20
 
@@ -1356,12 +1370,21 @@ private const val MAX_QUEUE = 20
 private const val TRACK_HEIGHT_DP = 48f
 
 /**
- * V9.6：贯穿式弹幕的轨道号上限（仅用于 `occupiedTracks` 登记，**不再限制同屏条数**）。
+ * 贯穿式弹幕「同一条轨道可以再塞一条」所需的右缘留白（dp，V11.8）。
  *
- * 真正决定「能显示几条」的是屏幕还剩多少空位（见 `findFreeYDp`）。
- * 这里给一个足够大的值，只为避免占用集合无限增长。
+ * 前一条的气泡右缘必须已经滚离屏幕右边这个距离，新的一条才允许从右缘起滚——
+ * 这样两条之间始终隔着一段空白，肉眼上绝不会重叠。
  */
-private const val MAX_TRACKS = 64
+private const val DANMAKU_REUSE_GAP_DP = 24f
+
+/**
+ * 贯穿式弹幕同时挂载的**安全上限**（V11.8）。
+ *
+ * 用户要求「可以超过 5 条」，所以不再按「同屏最多条数」限流；但每条弹幕都是一个
+ * 全宽独立 Window + 独立 ComposeView/Recomposer/Surface，必须留一个防失控的硬顶。
+ * 24 条远超实际观感需求（正常情况下轨道数 × 2~3 就到头了）。
+ */
+private const val MAX_DANMAKU_WINDOWS = 24
 
 /** 定位式弹幕「逐条依次出现」的淡入错峰间隔（ms）：第 i 条延迟 i × 本值。 */
 private const val STACK_STAGGER_MS = 150

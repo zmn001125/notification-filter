@@ -32,7 +32,15 @@ data class MediaSnapshot(
     val playing: Boolean = false,
     /** metadata 里其余所有**可转成字符串**的键（键名原样，如 `android.media.metadata.X`）。 */
     val extras: List<Pair<String, String>> = emptyList(),
+    /** 最近一次**读取**的时刻（内容没变也会刷新）。 */
     val updatedAtMs: Long = 0L,
+    /**
+     * 最近一次**内容真的变了**的时刻（V11.6）。
+     *
+     * 与 [updatedAtMs] 分开是为了能一眼看出「读得勤不勤」和「播放器写得勤不勤」：
+     * 前者一直在跳、后者不动 = 是播放器自己不更新 metadata，第三方无能为力。
+     */
+    val contentChangedAtMs: Long = 0L,
 )
 
 /**
@@ -89,28 +97,42 @@ object MediaSessionHolder {
     /** 指定 App 的媒体快照（没有则 null）。 */
     fun forPackage(pkg: String?): MediaSnapshot? = pkg?.let { _byPackage.value[it] }
 
-    /** 写入一份快照（同值不写，避免高频重组）。 */
-    fun update(snapshot: MediaSnapshot) {
-        if (!enabled) return
+    /**
+     * 写入一份快照（同值不写，避免高频重组）。
+     *
+     * @return **内容是否真的变了**（`updatedAtMs` 不计入比较）。
+     *   调用方（[MediaSessionSource]）据此决定要不要通知上层「媒体内容有新值」——
+     *   只是刷新时间戳不算变化（V11.6）。
+     */
+    @Synchronized
+    fun update(snapshot: MediaSnapshot): Boolean {
+        if (!enabled) return false
         val prev = _byPackage.value[snapshot.packageName]
-        if (prev != null && prev.copy(updatedAtMs = 0L) == snapshot.copy(updatedAtMs = 0L)) {
+        if (prev != null &&
+            prev.copy(updatedAtMs = 0L, contentChangedAtMs = 0L) ==
+            snapshot.copy(updatedAtMs = 0L, contentChangedAtMs = 0L)
+        ) {
             // 内容没变：只刷新时间戳，避免订阅者被无意义唤醒
             if (prev.updatedAtMs != snapshot.updatedAtMs) {
                 _byPackage.value = _byPackage.value +
                     (snapshot.packageName to prev.copy(updatedAtMs = snapshot.updatedAtMs))
             }
-            return
+            return false
         }
         lastPackage = snapshot.packageName
-        _byPackage.value = _byPackage.value + (snapshot.packageName to snapshot)
+        _byPackage.value = _byPackage.value +
+            (snapshot.packageName to snapshot.copy(contentChangedAtMs = snapshot.updatedAtMs))
+        return true
     }
 
+    @Synchronized
     fun remove(pkg: String) {
         if (!_byPackage.value.containsKey(pkg)) return
         _byPackage.value = _byPackage.value - pkg
         if (lastPackage == pkg) lastPackage = null
     }
 
+    @Synchronized
     fun reset() {
         if (_byPackage.value.isEmpty()) return
         _byPackage.value = emptyMap()

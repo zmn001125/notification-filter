@@ -48,6 +48,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.local.notificationfilter.core.model.FieldGroup
 import com.local.notificationfilter.core.model.FieldRef
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import com.local.notificationfilter.core.model.MatchField
 import com.local.notificationfilter.core.model.MetaFieldKind
 
@@ -194,6 +197,26 @@ fun FieldPickerSheet(
                     "勾选任一字段后才会开始采集，否则零开销。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            // V11.6：把「这份媒体快照是什么时候取的、内容最后什么时候真的变过」直接摆出来。
+            // 排查「媒体标题很久才变」时这一行就能定性：
+            // 「读取于」一直在跳 = 采样在跑；「内容变化于」不动 = 播放器自己不写 metadata。
+            val mediaUpdatedAt = latestMedia?.updatedAtMs ?: 0L
+            val mediaChangedAt = latestMedia?.contentChangedAtMs ?: 0L
+            Text(
+                text = if (mediaUpdatedAt > 0L) {
+                    "读取于 " + formatHms(mediaUpdatedAt) +
+                        (if (mediaChangedAt > 0L) " · 内容变化于 " + formatHms(mediaChangedAt) else "") +
+                        "（播放中每秒刷新）"
+                } else {
+                    "尚未取到媒体会话（没有在播放，或没有规则引用 media.* 字段）"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = if (mediaUpdatedAt > 0L) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
             )
             Spacer(Modifier.height(4.dp))
             FlowRow(
@@ -390,6 +413,13 @@ fun SelectedFieldChip(
  * 键名与 `FieldExtractor.mediaExtras()` 的生成口径必须一致，否则选了也匹配不到。
  * `media.title` 对应 `METADATA_KEY_TITLE`；部分播放器会用它放当前播放进度或自定义文案，不要假设它一定是歌名。
  */
+private val MEDIA_SNAPSHOT_TIME_FMT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss")
+
+/** 毫秒时间戳 → `HH:mm:ss`（媒体快照的「读取于 / 内容变化于」用）。 */
+private fun formatHms(millis: Long): String = Instant.ofEpochMilli(millis)
+    .atZone(ZoneId.systemDefault())
+    .format(MEDIA_SNAPSHOT_TIME_FMT)
+
 private val MEDIA_FIELD_PRESETS: List<Pair<String, String>> = listOf(
     "media.title" to "媒体标题",
     "media.displayTitle" to "显示标题",

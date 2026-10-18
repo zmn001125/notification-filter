@@ -22,6 +22,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -63,7 +64,9 @@ import com.local.notificationfilter.util.PermissionType
  * - 多条条件之间是 **OR**（任一满足即触发）；
  * - 每条条件有「效果（显示 / 隐藏）」+「条件不成立时也触发（取反）」两个独立开关；
  * - 参数没配齐的条件在编译期被丢弃（`OverlayTrigger.isEffective`），UI 用红字提前告知；
- * - 显示前置是「④ 动作 → 自定义位置悬浮」已勾选（否则本节无意义）。
+ * - 显示前置是「④ 动作 → 自定义位置悬浮」已勾选（否则本节无意义）；
+ * - V12：每条条件还可选「满足时作用于哪条规则的悬浮窗」（`OverlayTrigger.targetRuleId`，
+ *   留空 = 本条规则自己的），于是不同规则的悬浮窗可同时在屏幕上显示、互不顶掉。
  *
  * @param vm 规则编辑 ViewModel（表单状态唯一所有者）
  * @param state 当前表单快照
@@ -93,7 +96,8 @@ fun OverlayTriggerEditorSection(vm: RuleEditViewModel, state: RuleEditUiState) {
         Spacer(Modifier.height(4.dp))
         Text(
             text = "任一条件满足即触发（OR）；同时命中「显示」与「消失」时以消失为准。" +
-                "留空 = 命中通知时直接显示。",
+                "不同规则的悬浮窗可同时在屏幕上显示，互不顶掉；每条条件可指定作用于哪条规则的" +
+                "悬浮窗，留空 = 本条规则自己的。",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -108,6 +112,8 @@ fun OverlayTriggerEditorSection(vm: RuleEditViewModel, state: RuleEditUiState) {
         }
 
         var rulePickerFor by remember { mutableStateOf<Int?>(null) }
+        // V12：「满足时作用于哪条规则的悬浮窗」单选弹窗的持有者（节级，避免每张卡各持一份）
+        var targetPickerFor by remember { mutableStateOf<Int?>(null) }
 
         state.floatTriggers.forEachIndexed { index, trigger ->
             Spacer(Modifier.height(8.dp))
@@ -121,6 +127,10 @@ fun OverlayTriggerEditorSection(vm: RuleEditViewModel, state: RuleEditUiState) {
                 onOpenRulePicker = {
                     vm.loadSelectableRules()
                     rulePickerFor = index
+                },
+                onOpenTargetPicker = {
+                    vm.loadSelectableRules()
+                    targetPickerFor = index
                 },
             )
         }
@@ -157,6 +167,29 @@ fun OverlayTriggerEditorSection(vm: RuleEditViewModel, state: RuleEditUiState) {
             }
         }
 
+        // V12：目标规则单选对话框（条件满足时作用于哪条规则的悬浮窗）
+        LaunchedEffect(targetPickerFor, state.floatTriggers.size) {
+            val current = targetPickerFor
+            if (current != null && current >= state.floatTriggers.size) {
+                targetPickerFor = null
+            }
+        }
+        targetPickerFor?.let { index ->
+            val trigger = state.floatTriggers.getOrNull(index)
+            if (trigger != null) {
+                TargetRulePickerDialog(
+                    rules = state.selectableRules,
+                    loading = state.rulesLoading,
+                    initialId = trigger.targetRuleId,
+                    onDismiss = { targetPickerFor = null },
+                    onConfirm = { id ->
+                        vm.updateTrigger(index) { it.copy(targetRuleId = id) }
+                        targetPickerFor = null
+                    },
+                )
+            }
+        }
+
         Spacer(Modifier.height(8.dp))
         Text(
             // V9 语义修正：条件**不接管**卡片生命周期，只做「提前显示 / 提前清除」。
@@ -171,7 +204,7 @@ fun OverlayTriggerEditorSection(vm: RuleEditViewModel, state: RuleEditUiState) {
 
 // ==================== 单条条件卡片 ====================
 
-/** 一条条件：类型 chips + 参数区 + 效果 chips + 取反开关 + 删除。 */
+/** 一条条件：类型 chips + 参数区 + 效果 chips + 目标规则 + 取反开关 + 删除。 */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun TriggerCard(
@@ -182,6 +215,7 @@ private fun TriggerCard(
     onUpdate: ((OverlayTrigger) -> OverlayTrigger) -> Unit,
     onRemove: () -> Unit,
     onOpenRulePicker: () -> Unit,
+    onOpenTargetPicker: () -> Unit,
 ) {
     NfCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -309,6 +343,54 @@ private fun TriggerCard(
                     label = { Text(effect.label) },
                 )
             }
+        }
+
+        // —— V12：满足时作用于哪条规则的悬浮窗 ——
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = "满足时作用于：",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(4.dp))
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            OutlinedButton(onClick = onOpenTargetPicker) {
+                Text(
+                    if (trigger.targetRuleId == null) {
+                        "当前规则的悬浮窗"
+                    } else {
+                        "其他规则的悬浮窗"
+                    },
+                )
+            }
+            val targetId = trigger.targetRuleId
+            Text(
+                text = if (targetId == null) {
+                    "（留空 = 本条规则自己的悬浮窗）"
+                } else {
+                    selectableRules.firstOrNull { it.id == targetId }
+                        ?.let { it.name.ifBlank { "规则 ${it.id}" } }
+                        ?: "规则 $targetId"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        // 引用的目标规则不存在（或没有配置悬浮动作）→ 红字提示（保存不受影响，
+        // 求值时该条件按「目标缺失」跳过，见 OverlayConditionArbiter.applyShow）
+        val targetId = trigger.targetRuleId
+        if (targetId != null && !rulesLoading && selectableRules.isNotEmpty() &&
+            selectableRules.none { it.id == targetId && it.actions.float != null }
+        ) {
+            Text(
+                text = "引用的规则不存在或未配置悬浮",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error,
+            )
         }
 
         // —— 取反 ——
@@ -509,6 +591,102 @@ private fun RulePickerDialog(
                                         selected = if (checked) selected + rule.id
                                         else selected - rule.id
                                     },
+                                )
+                                Text(
+                                    text = rule.name.ifBlank { "规则 ${rule.id}" },
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(selected) }) { Text("确定") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
+}
+
+// ==================== 目标规则单选对话框（V12） ====================
+
+/**
+ * 目标规则**单选**对话框（V12：条件满足时作用于哪条规则的悬浮窗）。
+ *
+ * 第一项「当前规则的悬浮窗（默认）」→ [onConfirm] 传 null；其余只列**已配置悬浮动作**的
+ * 规则（没有悬浮样式的规则被指向也没有窗口可作用，与 TriggerIndex.targets 同口径）。
+ * 排除自身已由 ViewModel 的 `loadSelectableRules` 完成。
+ *
+ * @param rules 可选规则（ViewModel 已排除自身）
+ * @param loading 数据源加载中
+ * @param initialId 当前选中的目标规则 id（null = 当前规则）
+ */
+@Composable
+private fun TargetRulePickerDialog(
+    rules: List<Rule>,
+    loading: Boolean,
+    initialId: Long?,
+    onDismiss: () -> Unit,
+    onConfirm: (Long?) -> Unit,
+) {
+    var selected by remember { mutableStateOf(initialId) }
+    val candidates = rules.filter { it.actions.float != null }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("选择作用于哪条规则的悬浮窗") },
+        text = {
+            Column(modifier = Modifier.heightIn(max = 400.dp)) {
+                Text(
+                    text = "不同规则的悬浮窗可同时在屏幕上显示，互不顶掉；" +
+                        "选其他规则时，用它自己的样式与内容显示 / 消失。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                when {
+                    loading && rules.isEmpty() -> Text(
+                        text = "正在加载规则…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+
+                    candidates.isEmpty() -> Text(
+                        text = "没有其他已配置悬浮动作的规则",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+
+                    else -> LazyColumn {
+                        item {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                RadioButton(
+                                    selected = selected == null,
+                                    onClick = { selected = null },
+                                )
+                                Text(
+                                    text = "当前规则的悬浮窗（默认）",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                        }
+                        items(candidates.size) { i ->
+                            val rule = candidates[i]
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                RadioButton(
+                                    selected = selected == rule.id,
+                                    onClick = { selected = rule.id },
                                 )
                                 Text(
                                     text = rule.name.ifBlank { "规则 ${rule.id}" },

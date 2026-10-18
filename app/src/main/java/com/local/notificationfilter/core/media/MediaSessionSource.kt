@@ -10,6 +10,14 @@ import android.os.Handler
 import android.os.Looper
 import com.local.notificationfilter.service.NfNotificationListener
 import com.local.notificationfilter.util.NfLog
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 /**
  * 媒体会话采集源（V10.8）。
@@ -37,6 +45,18 @@ class MediaSessionSource(context: Context) {
     private val handler = Handler(Looper.getMainLooper())
     private val bindings = HashMap<MediaController, MediaController.Callback>()
 
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var refreshJob: Job? = null
+
+    /**
+     * 媒体内容**真的有了新值**时的回调（V11.6）。
+     *
+     * 用途：让上层把「流水里这条通知的字段」和规则看到的内容跟上最新媒体信息，
+     * 而不是等到播放器下一次重发通知。**只在内容变化时触发**（同值不触发），
+     * 上层据此做节流，不会因为每秒采样而刷库。
+     */
+    var onMediaChanged: ((packageName: String) -> Unit)? = null
+
     @Volatile
     private var attached = false
 
@@ -57,6 +77,7 @@ class MediaSessionSource(context: Context) {
             bindAll(manager.getActiveSessions(component))
             NfLog.i(this, "媒体会话采集已挂载（${bindings.size} 个会话）")
         }.onFailure { NfLog.w(this, "媒体会话采集挂载失败: ${it.message}") }
+        startRefresher()
     }
 
     /**
@@ -78,12 +99,91 @@ class MediaSessionSource(context: Context) {
             // 已绑定的也重读一次（可能不在 current 里但仍在册）
             bindings.keys.toList().forEach { publish(it) }
         }.onFailure { NfLog.w(this, "刷新媒体会话失败: ${it.message}") }
+        // V11.6：回调拿不到时也能立刻取到最新值
+        refreshFromSessions()
+    }
+
+    /**
+     * **V11.6：兜底实时刷新。**
+     *
+     * ## 为什么需要它（真机实测结论）
+     * 网易云这类把歌词塞进 `METADATA_KEY_TITLE` 的播放器，`MediaSession` 里的 metadata
+     * 确实在逐句变化，但 `MediaController.Callback.onMetadataChanged` **并不保证送到**
+     * （实测：只有播放/暂停这类状态切换、或重新取会话时才拿得到新歌词，
+     * 于是「媒体标题」看起来很久才变一次）。
+     * 而 `MediaController.getMetadata()` 读的是**该 controller 创建时的缓存**，
+     * 不重新取会话就永远是旧值——这就是字段一直不更新的根因。
+     *
+     * 所以这里按需重新 `getActiveSessions()`：
+     * 每次都会拿到**新的 controller**（构造时从 session 读一次当前 metadata），
+     * 于是能绕开失效的回调，拿到最新的歌词/标题。
+     *
+     * ## 开销（项目「无轮询」红线的唯一例外，边界写死）
+     * - `enabled == false`（没有任何规则引用 `media.*`）→ **一次 binder 都不调**；
+     * - 有会话在播放 → [POLL_PLAYING_MS]（1 秒一次，歌词换句粒度足够）；
+     * - 没在播放 → [POLL_IDLE_MS]（15 秒一次，只为发现「刚开始播放」）。
+     *   暂停/停止后不会继续高频唤醒。
+     */
+    private fun startRefresher() {
+        if (refreshJob != null) return
+        refreshJob = scope.launch {
+            while (isActive) {
+                val playing = MediaSessionHolder.enabled &&
+                    MediaSessionHolder.byPackage.value.values.any { it.playing }
+                delay(if (playing) POLL_PLAYING_MS else POLL_IDLE_MS)
+                if (!MediaSessionHolder.enabled) continue
+                refreshFromSessions()
+            }
+        }
+    }
+
+    /**
+     * 重新取一次活动会话并逐个读 metadata（新 controller = 新缓存，能绕过失效回调）。
+     *
+     * ## 读取与写入分离（V12 性能修补）
+     * 读 metadata 是 binder 调用，播放中每 500ms 就要读一轮，绝不能放在主线程；
+     * 因此这里在**协程线程**把每个新 controller 逐个读成不可变快照，
+     * 再**一次性**回主线程批量写 Holder（原来是每个 controller 各读各写一遍，
+     * 每 500ms 都有一批 binder 读取跑在主线程上）。
+     *
+     * ## 为什么不给新 controller 注册回调
+     * 轮询路径**不**在拿到的这些新 controller 上 `registerCallback`
+     * （注册只发生在 [bindAll]），所以会话侧不会累积回调；
+     * 新 controller 读完即被 GC，这是「拿最新 metadata」的必要代价。
+     * 边界由 [MediaSessionHolder.enabled] 门控 + 500ms / 15s 两档间隔写死，不会失控。
+     */
+    private fun refreshFromSessions() {
+        if (!MediaSessionHolder.enabled) return
+        // 取会话是 binder 调用 → 放在协程线程，别在主线程做
+        val controllers = runCatching {
+            val manager = appContext.getSystemService(Context.MEDIA_SESSION_SERVICE)
+                as MediaSessionManager
+            val component = ComponentName(appContext, NfNotificationListener::class.java)
+            manager.getActiveSessions(component)
+        }.onFailure { NfLog.w(this, "实时刷新媒体会话失败: ${it.message}") }
+            .getOrDefault(emptyList())
+        if (controllers.isEmpty()) return
+        // 读 metadata 同样是 binder 调用：播放中每 500ms 一轮，放在主线程会持续抢帧，
+        // 所以这一步留在协程线程逐个读成快照，单个 controller 失败只丢它自己。
+        val snapshots = controllers.mapNotNull { controller ->
+            runCatching { readSnapshot(controller) }
+                .onFailure { NfLog.w(this, "读取媒体 metadata 失败: ${it.message}") }
+                .getOrNull()
+        }
+        // 写 Holder **统一回主线程**：回调路径（onMetadataChanged）本来就跑在主线程，
+        // 这样所有写入串行，不会和轮询线程产生并发丢更新。
+        handler.post {
+            if (!MediaSessionHolder.enabled) return@post
+            snapshots.forEach { snapshot -> applySnapshot(snapshot) }
+        }
     }
 
     /** 卸载（幂等）：解绑监听与全部会话回调，并清空快照。 */
     fun detach() {
         if (!attached) return
         attached = false
+        refreshJob?.cancel()
+        refreshJob = null
         runCatching {
             val manager = appContext.getSystemService(Context.MEDIA_SESSION_SERVICE)
                 as MediaSessionManager
@@ -128,7 +228,12 @@ class MediaSessionSource(context: Context) {
     }
 
     /**
-     * 把一份 metadata 摊平成 [MediaSnapshot] 并写入 Holder。
+     * 读一份 metadata 摊平成 [MediaSnapshot] 并写入 Holder（**回调路径入口**）。
+     *
+     * 调用方全部是主线程上的即时读取：`bindAll` 对新会话的立即读、
+     * `onMetadataChanged` / `onPlaybackStateChanged` 回调（注册时带了主线程 handler）、
+     * 以及 `refreshNow()` 对已绑定会话的重读。轮询路径不走这里——
+     * 那边的 binder 读取已下沉到协程线程（见 [refreshFromSessions]）。
      *
      * 「所有字段」的口径：
      * - 标准字段逐个显式读取（title / displayTitle / artist / album / …），
@@ -139,34 +244,81 @@ class MediaSessionSource(context: Context) {
     private fun publish(controller: MediaController) {
         // 没有任何规则用到 media.* 时直接返回：不构造对象、不写 StateFlow
         if (!MediaSessionHolder.enabled) return
-        runCatching {
-            val metadata = controller.metadata
-            val allStrings = buildList {
-                metadata?.keySet()?.forEach { key ->
-                    val text = runCatching { metadata.getString(key) }.getOrNull()
-                    if (!text.isNullOrBlank()) add(key to text)
-                }
+        // 读可能抛异常（binder 断开等）：失败只丢这一次，不影响其他会话
+        val snapshot = runCatching { readSnapshot(controller) }
+            .onFailure { NfLog.w(this, "读取媒体 metadata 失败: ${it.message}") }
+            .getOrNull() ?: return
+        applySnapshot(snapshot)
+    }
+
+    /**
+     * 把一份 metadata 摊平成 [MediaSnapshot]（**只读不写，可抛异常，调用方负责兜底**）。
+     *
+     * ## 为什么与写入拆开（V12 性能修补）
+     * metadata 的每个键都是 binder 调用，播放中每 500ms 就要读一轮，
+     * 这类读取不能放主线程（会持续抢帧）；而 Holder 的写入必须留在主线程串行，
+     * 避免与回调路径（onMetadataChanged 等）竞争丢更新。
+     * 于是「读」与「写」拆成两个函数：读可以在协程线程，写只在主线程。
+     *
+     * 「所有字段」的口径：
+     * - 标准字段逐个显式读取（title / displayTitle / artist / album / …），
+     *   这样规则里可以直接看到语义化的键名；
+     * - **其余所有键**（含播放器自定义键）
+     *   原样进 [MediaSnapshot.extras]，规则侧用 `media.<原键名>` 访问。
+     */
+    private fun readSnapshot(controller: MediaController): MediaSnapshot {
+        val metadata = controller.metadata
+        // V11.6：**每个键单独兜底**。此前显式那十几个 getString 是裸调用，
+        // 只要有一个键实际存的是非 String 类型（`METADATA_KEY_YEAR` 等被部分播放器
+        // 存成 Long 很常见），整份快照就会抛异常、被调用方的 runCatching 吞掉 →
+        // 表现成「媒体字段很久不更新」，而不是只丢那一个字段。
+        fun str(key: String): String? = runCatching { metadata?.getString(key) }.getOrNull()
+        val allStrings = buildList {
+            metadata?.keySet()?.forEach { key ->
+                val text = runCatching { metadata.getString(key) }.getOrNull()
+                if (!text.isNullOrBlank()) add(key to text)
             }
-            MediaSessionHolder.update(
-                MediaSnapshot(
-                    packageName = controller.packageName,
-                    title = metadata?.getString(MediaMetadata.METADATA_KEY_TITLE),
-                    displayTitle = metadata?.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE),
-                    displaySubtitle = metadata?.getString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE),
-                    displayDescription = metadata?.getString(MediaMetadata.METADATA_KEY_DISPLAY_DESCRIPTION),
-                    artist = metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST),
-                    album = metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM),
-                    albumArtist = metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST),
-                    genre = metadata?.getString(MediaMetadata.METADATA_KEY_GENRE),
-                    composer = metadata?.getString(MediaMetadata.METADATA_KEY_COMPOSER),
-                    writer = metadata?.getString(MediaMetadata.METADATA_KEY_WRITER),
-                    year = metadata?.getString(MediaMetadata.METADATA_KEY_YEAR),
-                    durationMs = metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION),
-                    playing = controller.playbackState?.state == PlaybackState.STATE_PLAYING,
-                    extras = allStrings,
-                    updatedAtMs = System.currentTimeMillis(),
-                ),
-            )
-        }.onFailure { NfLog.w(this, "读取媒体 metadata 失败: ${it.message}") }
+        }
+        return MediaSnapshot(
+            packageName = controller.packageName,
+            title = str(MediaMetadata.METADATA_KEY_TITLE),
+            displayTitle = str(MediaMetadata.METADATA_KEY_DISPLAY_TITLE),
+            displaySubtitle = str(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE),
+            displayDescription = str(MediaMetadata.METADATA_KEY_DISPLAY_DESCRIPTION),
+            artist = str(MediaMetadata.METADATA_KEY_ARTIST),
+            album = str(MediaMetadata.METADATA_KEY_ALBUM),
+            albumArtist = str(MediaMetadata.METADATA_KEY_ALBUM_ARTIST),
+            genre = str(MediaMetadata.METADATA_KEY_GENRE),
+            composer = str(MediaMetadata.METADATA_KEY_COMPOSER),
+            writer = str(MediaMetadata.METADATA_KEY_WRITER),
+            year = str(MediaMetadata.METADATA_KEY_YEAR),
+            durationMs = runCatching {
+                metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION)
+            }.getOrNull(),
+            playing = controller.playbackState?.state == PlaybackState.STATE_PLAYING,
+            extras = allStrings,
+            updatedAtMs = System.currentTimeMillis(),
+        )
+    }
+
+    /**
+     * 把快照写入 Holder 并在内容真的变了时通知上层。**只允许在主线程调用。**
+     *
+     * 写入保持主线程串行：回调路径本来就在主线程，轮询路径也统一 post 回主线程后再写，
+     * 两条路径对 Holder 的写入不会交叉。
+     */
+    private fun applySnapshot(snapshot: MediaSnapshot) {
+        if (!MediaSessionHolder.enabled) return
+        val changed = MediaSessionHolder.update(snapshot)
+        // 只有内容真的变了才通知上层（上层据此刷新流水行，同值不重复写库）
+        if (changed) onMediaChanged?.invoke(snapshot.packageName)
+    }
+
+    private companion object {
+        /** 播放中：每秒取一次（歌词换句粒度 2~5 秒，1 秒足够跟手）。 */
+        const val POLL_PLAYING_MS = 500L
+
+        /** 未播放：15 秒取一次，只为发现「刚开始播放」，不做高频唤醒。 */
+        const val POLL_IDLE_MS = 15_000L
     }
 }

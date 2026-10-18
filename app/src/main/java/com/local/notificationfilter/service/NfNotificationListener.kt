@@ -81,7 +81,12 @@ class NfNotificationListener : NotificationListenerService() {
         container.overlayConditionArbiter.attach()
 
         // V10.8：媒体会话采集（按需启用，见 refreshMediaCollection）
-        mediaSource = MediaSessionSource(this).also { it.attach() }
+        // V11.6：内容真变了就回调管线去刷新流水里的 media.*（播放器的元数据变化
+        // 不一定伴随重发通知，只等通知会拿不到实时歌词）。
+        mediaSource = MediaSessionSource(this).also { src ->
+            src.onMediaChanged = { pkg -> pipeline?.onMediaChanged(pkg) }
+            src.attach()
+        }
         refreshMediaCollection()
 
         val pipe = NotificationPipeline(container, this)
@@ -163,11 +168,14 @@ class NfNotificationListener : NotificationListenerService() {
                     rule.enabled && rule.extrasFields.any { it.startsWith(MEDIA_FIELD_PREFIX) }
                 }
             }.getOrDefault(false)
+            val wasEnabled = MediaSessionHolder.enabled
             MediaSessionHolder.setEnabled(needed)
             NfLog.i(
                 this@NfNotificationListener,
                 "媒体字段采集：${if (needed) "已启用" else "未启用（没有规则引用 $MEDIA_FIELD_PREFIX）"}",
             )
+            // V11.6：刚由关变开时立刻取一次，不用等兜底轮询的下一拍（未播放时最长 15 秒）
+            if (needed && !wasEnabled) mediaSource?.refreshNow()
         }
     }
 

@@ -3,6 +3,7 @@ package com.local.notificationfilter.service
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import com.local.notificationfilter.AppContainer
+import com.local.notificationfilter.core.media.MediaSessionHolder
 import com.local.notificationfilter.core.model.ActionType
 import com.local.notificationfilter.core.model.FieldRef
 import com.local.notificationfilter.core.model.NfJson
@@ -256,6 +257,79 @@ class NotificationPipeline(
             )
         }
 
+    /**
+     * V11.6 / V11.7：媒体会话内容变了（歌词 / 标题换了，播放器**没有**重发通知）。
+     *
+     * 背景：`media.*` 是构造快照那一刻从 `MediaSession` 拍下来的，而快照只在
+     * 「有新通知投递」时构造 → 播放器不重发通知，流水里的 `media.*` 就冻住；
+     * 规则也不会再被触发（用户实测：**只有第一次生效**）。
+     *
+     * 这里做两件事：
+     * 1. **刷新内容**：重建快照（此时 `media.*` 已是最新值）并就地改写它占的那一行；
+     * 2. **重跑规则**：只用「引用了 `media.*` 的规则」再判一次，命中了就执行动作
+     *    （弹幕 / 悬浮 / 替换 / 朗读 / 消除 …… 也就是「实时拿到新值再显示」）。
+     *
+     * 三条安全边界：
+     * - 只处理**已经登记在 [liveRecords] 里的存活通知**，绝不插新行、绝不改历史记录；
+     * - 统计只计一次（`alreadyCounted = true`）：媒体刷新不是新通知；
+     * - 剔除 `SNOOZE`（见 [MEDIA_SKIP_ACTIONS]）：避免每句歌词排一个闹钟。
+     */
+    fun onMediaChanged(packageName: String) {
+        scope.launch { handleMediaChanged(packageName) }
+    }
+
+    private suspend fun handleMediaChanged(packageName: String) = mutex.withLock {
+        if (!MediaSessionHolder.enabled) return@withLock
+        if (!container.settingsRepository.isMasterEnabled()) return@withLock
+        val sbns = activeStatusBarNotifications().filter { it.packageName == packageName }
+        if (sbns.isEmpty()) return@withLock
+        // 只让「匹配字段里引用了 media.*」的启用规则参与：别的规则与媒体内容无关，
+        // 不该被每句歌词带着跑（否则歌词一变就把所有规则重跑一遍）。
+        val mediaRules = runCatching {
+            container.ruleRepository.getAll().filter { rule ->
+                rule.enabled && rule.extrasFields.any { it.startsWith(MEDIA_FIELD_PREFIX) }
+            }
+        }.getOrDefault(emptyList())
+        val now = System.currentTimeMillis()
+        val epochDay = LocalDate.now(ZoneId.systemDefault()).toEpochDay().toInt()
+        var refreshed = 0
+        var fired = 0
+        for (sbn in sbns) {
+            val row = liveRecords[sbn.key] ?: continue
+            val appName = AppUtils.appNameOf(appContext, sbn.packageName)
+            val snapshot = FieldExtractor.fromStatusBar(sbn, appName)
+            // ① 内容先刷新：即使没有规则命中，流水 / 详情也要能看到最新的 media.*
+            container.recordRepository.updateSnapshot(row.recordId, snapshot, appName, now)
+            row.lastWriteAt = now
+            refreshed++
+            if (mediaRules.isEmpty()) continue
+            // ② 再按新内容重跑（匹配 + 动作 + 命中边沿都在 evaluate 里）
+            val evaluation = evaluate(
+                sbn = sbn,
+                snapshot = snapshot,
+                rules = mediaRules,
+                allowOverlay = true,
+                skipActions = MEDIA_SKIP_ACTIONS,
+            )
+            if (evaluation !is Evaluation.Matched) continue
+            persistEvaluation(
+                recordId = row.recordId,
+                snapshot = snapshot,
+                appName = appName,
+                epochDay = epochDay,
+                evaluation = evaluation,
+                alreadyCounted = true,
+            )
+            fired++
+        }
+        if (refreshed > 0) {
+            NfLog.d(
+                this,
+                "媒体内容变化 → 刷新 $packageName（$refreshed 行，重跑命中 $fired 次）",
+            )
+        }
+    }
+
     fun onRemoved(sbn: StatusBarNotification) {
         // 待明确 #6（默认决议）：原通知被源 App 主动取消时，延时重发任务仍按计划执行，
         // 因此这里不清理 pending_reposts，仅记录日志便于排查。
@@ -462,6 +536,13 @@ class NotificationPipeline(
         snapshot: NotificationSnapshot,
         rules: List<Rule>,
         allowOverlay: Boolean,
+        /**
+         * 本次判定要**剔掉**的动作（V11.7）。
+         *
+         * 唯一使用者是「媒体内容变化 → 重跑规则」：那条路径每句歌词都会走一遍，
+         * 而 `SNOOZE`（推迟）是排程动作，重复执行等于每句歌词排一个闹钟。
+         */
+        skipActions: Set<ActionType> = emptySet(),
     ): Evaluation {
         // —— 黑名单：无条件消除，优先于一切规则 ——
         if (container.blacklistRepository.contains(snapshot.packageName)) {
@@ -496,7 +577,7 @@ class NotificationPipeline(
         val willUseOverlay = match.plannedActions.any {
             it == ActionType.DANMAKU || it == ActionType.FLOAT
         }
-        val plannedActions = if (allowOverlay) {
+        val plannedActions = (if (allowOverlay) {
             match.plannedActions
         } else {
             match.plannedActions.filterNot { it == ActionType.DANMAKU || it == ActionType.FLOAT }
@@ -509,7 +590,10 @@ class NotificationPipeline(
                         )
                     }
                 }
-        }
+        })
+            // V11.7：媒体内容每次都变时，**推迟**这种一次性排程动作不能跟着重复执行，
+            // 否则每句歌词都会排一个闹钟（见 [MEDIA_SKIP_ACTIONS]）。
+            .filterNot { it in skipActions }
 
         // 4) 动作执行（T06 负责 `floatIsConditional` 分支；V10 静音消除在 BLOCK 分支内）
         val executed = container.actionExecutor.execute(rule, snapshot, plannedActions, sbn)
@@ -719,6 +803,19 @@ class NotificationPipeline(
          * 反倒应该一次性全部补做（否则「保存后通知没消失」又成了新的 bug）。
          */
         const val MAX_REPROCESS_OVERLAY = 3
+
+        /** 媒体字段的键前缀（V10.8 起由 `FieldExtractor.mediaExtras()` 注入）。 */
+        const val MEDIA_FIELD_PREFIX = "media."
+
+        /**
+         * 「媒体内容变化 → 重跑规则」时要剔除的动作（V11.7）。
+         *
+         * 只有 [ActionType.SNOOZE]：它是**排程**动作（给这条通知排一个到点重发的闹钟）。
+         * 媒体内容每句歌词都在变，若跟着重复执行，一首歌就能排出几十个闹钟，
+         * 到点把同一条通知重发几十遍。其余动作（消除 / 替换 / 朗读 / 弹幕 / 悬浮 / 打开）
+         * 都是「立刻呈现新内容」的语义，正是这条路径存在的意义。
+         */
+        val MEDIA_SKIP_ACTIONS: Set<ActionType> = setOf(ActionType.SNOOZE)
     }
 }
 

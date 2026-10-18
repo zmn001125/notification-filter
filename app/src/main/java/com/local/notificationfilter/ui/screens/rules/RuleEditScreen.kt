@@ -214,7 +214,8 @@ fun RuleEditScreen(
             title = "顺丰速运",
             text = "取件码 8-3-9201，请在 24 小时内领取",
         )
-        val ok = OverlayController.showFloat(payload, state.floatStyle)
+        // V12：预览走固定 key（__preview__），与业务悬浮（key = 规则 id）互不顶掉
+        val ok = OverlayController.showFloat(OverlayController.PREVIEW_FLOAT_KEY, payload, state.floatStyle)
         if (!ok) {
             scope.launch { snackbarHostState.showSnackbar("悬浮窗权限未授予，无法预览悬浮窗") }
         }
