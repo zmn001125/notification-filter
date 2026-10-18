@@ -671,9 +671,19 @@ fun RuleEditScreen(
                             // Binder IPC，正好落在进页的一两帧上，真机表现就是「卡一下」。
                             // 解析尚未回来时回落包名，显示效果与最终态一致（只是少了应用名）。
                             state.scopePackages.forEach { pkg ->
-                                AssistChip(
-                                    onClick = { showAppPicker = true },
+                                // V12：已选 App 应可删除——点 chip 本体即从作用范围中移除，
+                                //  trailingIcon 的关闭图标仅作视觉提示。「选择 App」按钮仍是增选入口。
+                                InputChip(
+                                    selected = true,
+                                    onClick = { vm.setScopePackages(state.scopePackages - pkg) },
                                     label = { Text(state.scopeAppNames[pkg] ?: pkg) },
+                                    trailingIcon = {
+                                        Icon(
+                                            Icons.Filled.Close,
+                                            contentDescription = "移除该应用",
+                                            modifier = Modifier.size(16.dp),
+                                        )
+                                    },
                                 )
                             }
                         }

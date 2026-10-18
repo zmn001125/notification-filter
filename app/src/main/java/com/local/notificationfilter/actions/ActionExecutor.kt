@@ -248,8 +248,8 @@ class ActionExecutor(
                 // V7 曾在此跳过 showFloat（条件是唯一出卡路径），导致「停留时长失效、
                 // 只有条件成立才出卡」，与用户预期相反，已废弃。
                 // V12：key = 规则 id —— 不同规则的悬浮各占一窗、同时显示互不顶掉；
-                // 条件若指定了目标规则（OverlayTrigger.targetRuleId），则由
-                // OverlayConditionArbiter 开那条规则的窗，不走本路径。
+                // 条件若指定了目标规则（V12.1 起可多选，OverlayTrigger.allTargetRuleIds），则由
+                // OverlayConditionArbiter 开那些规则的窗，不走本路径。
                 val ok = OverlayController.showFloat(
                     rule.id.toString(),
                     buildOverlayPayload(

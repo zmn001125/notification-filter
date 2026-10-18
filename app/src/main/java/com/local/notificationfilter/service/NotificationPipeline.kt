@@ -259,20 +259,39 @@ class NotificationPipeline(
 
     /**
      * V11.6 / V11.7：媒体会话内容变了（歌词 / 标题换了，播放器**没有**重发通知）。
+     * V12.1：候选范围从「媒体会话所属包」放宽到**通知栏全量**（修「media.playing 变化后
+     * 规则不生效」，两个盲区见下）。
      *
      * 背景：`media.*` 是构造快照那一刻从 `MediaSession` 拍下来的，而快照只在
      * 「有新通知投递」时构造 → 播放器不重发通知，流水里的 `media.*` 就冻住；
      * 规则也不会再被触发（用户实测：**只有第一次生效**）。
      *
-     * 这里做两件事：
-     * 1. **刷新内容**：重建快照（此时 `media.*` 已是最新值）并就地改写它占的那一行；
-     * 2. **重跑规则**：只用「引用了 `media.*` 的规则」再判一次，命中了就执行动作
-     *    （弹幕 / 悬浮 / 替换 / 朗读 / 消除 …… 也就是「实时拿到新值再显示」）。
+     * V12.1 修复的旧实现两个盲区（旧实现只重跑「播放器包且已进过管线」的通知）：
+     * 1. `media.*` 是 `FieldExtractor.mediaExtras()` 从 `MediaSessionHolder.latest()`
+     *    **全局**注入到**每一条**通知 extras 里的（core/ruleengine/FieldExtractor.kt:66-90），
+     *    任何作用域的规则都可能引用它，不只播放器包的通知关心它 → 候选必须全量；
+     * 2. 不在 [liveRecords] 里的存量通知（App 重启前就在通知栏的、被本 App 消除过残留的）
+     *    旧实现被整条跳过 → 引用 `media.*` 的规则永远不再命中。它们没有行可写，
+     *    但仍要求值：条件悬浮（`RULE_NOTIFICATION` 引用该规则）靠 `evaluate` 里的
+     *    rememberSnapshot / emitMatched 实时反应。
+     *
+     * 这里做三件事：
+     * 1. **刷新内容**（仅已有 [liveRecords] 行的通知）：重建快照（此时 `media.*` 已是
+     *    最新值）并就地改写它占的那一行；
+     * 2. **重跑规则**：对全量候选用「引用了 `media.*` 的规则」再判一次，命中了就执行动作
+     *    （弹幕 / 悬浮 / 替换 / 朗读 / 消除 …… 也就是「实时拿到新值再显示」）；
+     * 3. **驱动条件**：没有流水的存量通知同样要求值（只求值 + 执行动作，不写任何记录）。
      *
      * 三条安全边界：
-     * - 只处理**已经登记在 [liveRecords] 里的存活通知**，绝不插新行、绝不改历史记录；
+     * - **绝不插新行、绝不改历史记录**：只有 [liveRecords] 里记着行号的通知才刷新内容
+     *   与结论，其余候选只求值不落库；
      * - 统计只计一次（`alreadyCounted = true`）：媒体刷新不是新通知；
      * - 剔除 `SNOOZE`（见 [MEDIA_SKIP_ACTIONS]）：避免每句歌词排一个闹钟。
+     *
+     * 成本可控：通知栏通常几十条，且整条路径已被 [MediaSessionHolder.enabled] 与
+     * 「有规则引用 media.*」双重门控（没有规则引用时 onMediaChanged 根本不会触发）。
+     *
+     * @param packageName 媒体会话所属包名（**仅用于日志**：候选是全量通知，不再按它过滤）
      */
     fun onMediaChanged(packageName: String) {
         scope.launch { handleMediaChanged(packageName) }
@@ -281,7 +300,9 @@ class NotificationPipeline(
     private suspend fun handleMediaChanged(packageName: String) = mutex.withLock {
         if (!MediaSessionHolder.enabled) return@withLock
         if (!container.settingsRepository.isMasterEnabled()) return@withLock
-        val sbns = activeStatusBarNotifications().filter { it.packageName == packageName }
+        // V12.1：候选 = 通知栏**全量**。media.* 是全局注入到每条通知 extras 里的，
+        // 任何作用域的规则都可能引用它；packageName 参数只用于日志。
+        val sbns = activeStatusBarNotifications()
         if (sbns.isEmpty()) return@withLock
         // 只让「匹配字段里引用了 media.*」的启用规则参与：别的规则与媒体内容无关，
         // 不该被每句歌词带着跑（否则歌词一变就把所有规则重跑一遍）。
@@ -293,17 +314,22 @@ class NotificationPipeline(
         val now = System.currentTimeMillis()
         val epochDay = LocalDate.now(ZoneId.systemDefault()).toEpochDay().toInt()
         var refreshed = 0
+        var evaluated = 0
         var fired = 0
         for (sbn in sbns) {
-            val row = liveRecords[sbn.key] ?: continue
+            // V12.1：没有 liveRecords 行的存量通知（App 重启前就在通知栏的 / 被本 App
+            // 消除过残留的）也要求值，只是没有行可写、不落任何库。
+            val row = liveRecords[sbn.key]
             val appName = AppUtils.appNameOf(appContext, sbn.packageName)
             val snapshot = FieldExtractor.fromStatusBar(sbn, appName)
-            // ① 内容先刷新：即使没有规则命中，流水 / 详情也要能看到最新的 media.*
-            container.recordRepository.updateSnapshot(row.recordId, snapshot, appName, now)
-            row.lastWriteAt = now
-            refreshed++
+            if (row != null) {
+                // ① 内容先刷新：即使没有规则命中，流水 / 详情也要能看到最新的 media.*
+                container.recordRepository.updateSnapshot(row.recordId, snapshot, appName, now)
+                row.lastWriteAt = now
+                refreshed++
+            }
             if (mediaRules.isEmpty()) continue
-            // ② 再按新内容重跑（匹配 + 动作 + 命中边沿都在 evaluate 里）
+            // ② 再按新内容重跑（匹配 + 动作 + 命中边沿 + 条件快照都在 evaluate 里）
             val evaluation = evaluate(
                 sbn = sbn,
                 snapshot = snapshot,
@@ -311,21 +337,25 @@ class NotificationPipeline(
                 allowOverlay = true,
                 skipActions = MEDIA_SKIP_ACTIONS,
             )
+            evaluated++
             if (evaluation !is Evaluation.Matched) continue
-            persistEvaluation(
-                recordId = row.recordId,
-                snapshot = snapshot,
-                appName = appName,
-                epochDay = epochDay,
-                evaluation = evaluation,
-                alreadyCounted = true,
-            )
+            // ③ 有 liveRecords 行的才把结论写回去；没有行的（纯条件驱动）到此为止
+            if (row != null) {
+                persistEvaluation(
+                    recordId = row.recordId,
+                    snapshot = snapshot,
+                    appName = appName,
+                    epochDay = epochDay,
+                    evaluation = evaluation,
+                    alreadyCounted = true,
+                )
+            }
             fired++
         }
-        if (refreshed > 0) {
+        if (refreshed > 0 || evaluated > 0) {
             NfLog.d(
                 this,
-                "媒体内容变化 → 刷新 $packageName（$refreshed 行，重跑命中 $fired 次）",
+                "媒体内容变化 → 刷新 $packageName（刷新 $refreshed 行，求值 $evaluated 条，命中 $fired 次）",
             )
         }
     }

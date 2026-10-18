@@ -94,20 +94,32 @@ data class OverlayTrigger(
     val ruleIds: Set<Long> = emptySet(),
 
     /**
-     * 条件作用的**目标规则** id（V12）。null = 当前规则（本条规则自己的悬浮窗）。
-     * 非 null = 把「显示 / 立即清除」作用到**那条规则**的悬浮窗（用它自己的样式与内容），
-     * 于是不同规则的悬浮窗可以同时在屏幕上存在、互不顶掉。
+     * V12.0 的旧单目标字段，**仅为兼容旧 JSON 而保留**；
+     * 新代码一律用 [allTargetRuleIds] / [targetRuleIds]。
+     *
+     * 语义（与 V12.0 一致）：非 null = 把「显示 / 立即清除」作用到**那条规则**的悬浮窗
+     * （用它自己的样式与内容），于是不同规则的悬浮窗可以同时在屏幕上存在、互不顶掉。
      *
      * 注意：目标是**可选项**，不参与 [isEffective] 的「参数是否配齐」判定——
      * 配没配目标都不影响这条条件本身的成立与否。
      */
     val targetRuleId: Long? = null,
 
+    /**
+     * 条件作用的**目标规则** id 列表（V12.1，多选）。
+     * 空 = 当前规则（本条规则自己的悬浮窗）；非空 = 同时作用到这些规则的悬浮窗
+     * （各用它们自己的样式与内容），于是一条条件可以控制多扇窗。
+     */
+    val targetRuleIds: List<Long> = emptyList(),
+
     /** kind = APP_NOTIFICATION / RULE_NOTIFICATION：关注「出现」还是「消失」。 */
     val edge: TriggerEdge = TriggerEdge.OCCUR,
 ) {
     /** [kind] 字符串的强类型视图（未知值回落 DEVICE_STATE，见 [OverlayTriggerKind.of]）。 */
     val kindEnum: OverlayTriggerKind get() = OverlayTriggerKind.of(kind)
+
+    /** 全部目标规则 id（多选字段 ∪ 旧单字段；空 = 当前规则）。 */
+    val allTargetRuleIds: Set<Long> get() = (targetRuleIds + listOfNotNull(targetRuleId)).toSet()
 
     /**
      * 参数是否配齐。未配齐的条目在编译期被丢弃（[OverlayTriggerConfig.effective]），
@@ -143,8 +155,13 @@ data class OverlayTrigger(
             OverlayTriggerKind.FOREGROUND_APP ->
                 "打开 ${packages.size} 个 App 之一 → $edgeWord"
         }
-        // V12：配了目标规则时在文案末尾点明（用户最关心「这条条件到底动谁的窗」）
-        return if (targetRuleId != null) "$base（作用于指定规则）" else base
+        // V12.1：配了目标规则（可多选）时在文案末尾点明（用户最关心「这条条件到底动谁的窗」）
+        val targetCount = allTargetRuleIds.size
+        return when {
+            targetCount == 0 -> base
+            targetCount == 1 -> "$base（作用于指定规则）"
+            else -> "$base（作用于 $targetCount 条指定规则）"
+        }
     }
 }
 

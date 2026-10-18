@@ -16,6 +16,7 @@ import com.local.notificationfilter.util.NfLog
 import java.time.Instant
 import java.time.ZoneId
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.collections.ifEmpty
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -64,8 +65,9 @@ internal class TriggerIndex(
     val rules: Map<Long, Rule> = emptyMap(),
 
     /**
-     * V12：被条件的 `targetRuleId` 引用、且 [RuleActionConfig.float] 非空的目标规则
-     * （id → Rule）。**不含**条件规则自身——它本来就在 [rules] 里。
+     * V12：被条件的目标规则（V12.1 起可多选，见 [OverlayTrigger.allTargetRuleIds]）引用、
+     * 且 [RuleActionConfig.float] 非空的目标规则（id → Rule）。
+     * **不含**条件规则自身——它本来就在 [rules] 里。
      *
      * 用途：条件的「显示 / 立即清除」可以打到**别的规则**的悬浮窗上（用它自己的样式与
      * 内容），于是不同规则的悬浮窗能同时在屏幕上存在、互不顶掉。
@@ -137,7 +139,7 @@ internal class TriggerIndex(
             val deviceSensitive = LinkedHashSet<Long>()
             val clockSensitive = LinkedHashSet<Long>()
             val kept = LinkedHashMap<Long, Rule>()
-            // V12：被 targetRuleId 引用的目标规则（有 float 才收；自身不收）
+            // V12：被条件的目标规则（V12.1 起可多选；有 float 才收；自身不收）
             val targets = LinkedHashMap<Long, Rule>()
 
             for (rule in rules) {
@@ -153,8 +155,10 @@ internal class TriggerIndex(
                     // V12：收集「这条条件作用于哪条规则的悬浮窗」。目标从全量列表解析，
                     // 有 float 才进 targets（没有悬浮样式的规则被指向也没有窗口可作用）；
                     // 指向自身不进（它本来就在 rules 里）。
-                    val targetId = trigger.targetRuleId
-                    if (targetId != null && targetId != rule.id && targetId !in targets) {
+                    // V12.1：目标可多选（allTargetRuleIds = 新多选字段 ∪ 旧单字段），
+                    // 一条条件可同时把多条规则收进 targets。
+                    for (targetId in trigger.allTargetRuleIds) {
+                        if (targetId == rule.id || targetId in targets) continue
                         rules.firstOrNull { it.id == targetId }
                             ?.takeIf { it.actions.float != null }
                             ?.let { targets[targetId] = it }
@@ -251,8 +255,9 @@ fun interface OverlayPayloadBuilder {
  * `ConcurrentHashMap` 的单键操作，不做跨线程遍历。
  *
  * 与 `OverlayController` 的分工：本类**不做任何窗口操作**，只调用
- * `OverlayController.showFloat` / `updateFloat` / `dismissFloat`（V12 起按目标规则 id
- * 一规则一窗，不同规则的悬浮窗互不顶掉）；「同 key 原地更新 vs 重建」由控制器内部判定
+ * `OverlayController.showFloat` / `updateFloat` / `dismissFloat`（V12 起按目标规则
+ * （V12.1 起可多选）id 一规则一窗，不同规则的悬浮窗互不顶掉）；
+ * 「同 key 原地更新 vs 重建」由控制器内部判定
  * （它持有窗口与门面状态，判断才不会跨线程失真）。
  */
 class OverlayConditionArbiter(
@@ -423,7 +428,7 @@ class OverlayConditionArbiter(
      * 只能渲染成一张合成快照（规则名 + 模板）。命中规则本身通常不是条件规则，
      * 所以这一步是条件 ⑤ 能看到真实内容的唯一途径。
      *
-     * V12：`targetRuleId` 指向的**目标规则**同样要留存快照——它的悬浮窗由条件驱动
+     * V12：目标规则（V12.1 起可多选）同样要留存快照——它的悬浮窗由条件驱动
      * 显示，没有快照就只剩合成内容（规则名 + 模板）。
      *
      * **零成本保证**：无任何条件规则时 `index.isEmpty` 直接返回；既不是条件规则 /
@@ -697,12 +702,16 @@ class OverlayConditionArbiter(
         // 于是 CLOCK_AT 每分钟只生效一次（顺序反了才会被自己挡掉）。
         markClockFired(ruleId, triggers, now)
 
-        // V12：按「目标规则」分组独立求值——同一规则的多条条件可以分别作用于不同规则的
-        // 悬浮窗（targetRuleId 为空 = 本条规则自己的），各组互不影响、可同时显示；
+        // V12：按「目标规则（V12.1 起可多选）」分组独立求值——同一规则的多条条件可以
+        // 分别作用于不同规则的悬浮窗（目标为空 = 本条规则自己的），各组互不影响、可同时显示；
+        // V12.1：一条条件可同时进多个目标组（allTargetRuleIds 多选）。
         // 组内多条仍是 OR、HIDE 优先（由 OverlayTriggerEvaluator.decide 保证）。
         val byTarget = LinkedHashMap<Long, MutableList<OverlayTrigger>>()
         for (trigger in triggers) {
-            byTarget.getOrPut(trigger.targetRuleId ?: ruleId) { mutableListOf() }.add(trigger)
+            val targetIds = trigger.allTargetRuleIds.ifEmpty { setOf(ruleId) }
+            for (targetId in targetIds) {
+                byTarget.getOrPut(targetId) { mutableListOf() }.add(trigger)
+            }
         }
         for ((targetId, subset) in byTarget) {
             val subsetDecision = OverlayTriggerEvaluator.decide(subset, context)

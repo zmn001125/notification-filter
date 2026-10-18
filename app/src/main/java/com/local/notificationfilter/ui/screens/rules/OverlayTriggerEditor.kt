@@ -20,9 +20,9 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.InputChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -65,8 +65,8 @@ import com.local.notificationfilter.util.PermissionType
  * - 每条条件有「效果（显示 / 隐藏）」+「条件不成立时也触发（取反）」两个独立开关；
  * - 参数没配齐的条件在编译期被丢弃（`OverlayTrigger.isEffective`），UI 用红字提前告知；
  * - 显示前置是「④ 动作 → 自定义位置悬浮」已勾选（否则本节无意义）；
- * - V12：每条条件还可选「满足时作用于哪条规则的悬浮窗」（`OverlayTrigger.targetRuleId`，
- *   留空 = 本条规则自己的），于是不同规则的悬浮窗可同时在屏幕上显示、互不顶掉。
+ * - V12：每条条件还可选「满足时作用于哪些规则的悬浮窗」（`OverlayTrigger.targetRuleIds`
+ *   多选，留空 = 本条规则自己的），于是不同规则的悬浮窗可同时在屏幕上显示、互不顶掉。
  *
  * @param vm 规则编辑 ViewModel（表单状态唯一所有者）
  * @param state 当前表单快照
@@ -112,7 +112,7 @@ fun OverlayTriggerEditorSection(vm: RuleEditViewModel, state: RuleEditUiState) {
         }
 
         var rulePickerFor by remember { mutableStateOf<Int?>(null) }
-        // V12：「满足时作用于哪条规则的悬浮窗」单选弹窗的持有者（节级，避免每张卡各持一份）
+        // V12：「满足时作用于哪些规则的悬浮窗」多选弹窗的持有者（节级，避免每张卡各持一份）
         var targetPickerFor by remember { mutableStateOf<Int?>(null) }
 
         state.floatTriggers.forEachIndexed { index, trigger ->
@@ -167,7 +167,7 @@ fun OverlayTriggerEditorSection(vm: RuleEditViewModel, state: RuleEditUiState) {
             }
         }
 
-        // V12：目标规则单选对话框（条件满足时作用于哪条规则的悬浮窗）
+        // V12：目标规则多选对话框（条件满足时作用于哪些规则的悬浮窗）
         LaunchedEffect(targetPickerFor, state.floatTriggers.size) {
             val current = targetPickerFor
             if (current != null && current >= state.floatTriggers.size) {
@@ -180,10 +180,11 @@ fun OverlayTriggerEditorSection(vm: RuleEditViewModel, state: RuleEditUiState) {
                 TargetRulePickerDialog(
                     rules = state.selectableRules,
                     loading = state.rulesLoading,
-                    initialId = trigger.targetRuleId,
+                    initialSelected = trigger.allTargetRuleIds,
                     onDismiss = { targetPickerFor = null },
-                    onConfirm = { id ->
-                        vm.updateTrigger(index) { it.copy(targetRuleId = id) }
+                    onConfirm = { ids ->
+                        // 空集合 = 只作用于本条规则自己的悬浮窗（旧单选字段不再写入）
+                        vm.updateTrigger(index) { it.copy(targetRuleIds = ids.toList()) }
                         targetPickerFor = null
                     },
                 )
@@ -359,35 +360,36 @@ private fun TriggerCard(
         ) {
             OutlinedButton(onClick = onOpenTargetPicker) {
                 Text(
-                    if (trigger.targetRuleId == null) {
+                    if (trigger.allTargetRuleIds.isEmpty()) {
                         "当前规则的悬浮窗"
                     } else {
-                        "其他规则的悬浮窗"
+                        "${trigger.allTargetRuleIds.size} 条其他规则的悬浮窗"
                     },
                 )
             }
-            val targetId = trigger.targetRuleId
             Text(
-                text = if (targetId == null) {
+                text = if (trigger.allTargetRuleIds.isEmpty()) {
                     "（留空 = 本条规则自己的悬浮窗）"
                 } else {
-                    selectableRules.firstOrNull { it.id == targetId }
-                        ?.let { it.name.ifBlank { "规则 ${it.id}" } }
-                        ?: "规则 $targetId"
+                    trigger.allTargetRuleIds.joinToString("、") { id ->
+                        selectableRules.firstOrNull { it.id == id }
+                            ?.let { it.name.ifBlank { "规则 ${it.id}" } }
+                            ?: "规则 $id"
+                    }
                 },
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.weight(1f),
             )
         }
-        // 引用的目标规则不存在（或没有配置悬浮动作）→ 红字提示（保存不受影响，
+        // 任一目标规则不存在（或没有配置悬浮动作）→ 红字提示（保存不受影响，
         // 求值时该条件按「目标缺失」跳过，见 OverlayConditionArbiter.applyShow）
-        val targetId = trigger.targetRuleId
-        if (targetId != null && !rulesLoading && selectableRules.isNotEmpty() &&
-            selectableRules.none { it.id == targetId && it.actions.float != null }
-        ) {
+        val missingTargets = trigger.allTargetRuleIds.filter { id ->
+            selectableRules.none { it.id == id && it.actions.float != null }
+        }
+        if (missingTargets.isNotEmpty() && !rulesLoading && selectableRules.isNotEmpty()) {
             Text(
-                text = "引用的规则不存在或未配置悬浮",
+                text = "有 ${missingTargets.size} 条目标规则不存在或未配置悬浮",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.error,
             )
@@ -450,6 +452,7 @@ private fun AppNotificationFields(packages: Set<String>, onChange: (Set<String>)
         packages = packages,
         buttonText = "选择 App",
         onOpen = { showPicker = true },
+        onRemove = { pkg -> onChange(packages - pkg) },
     )
     if (showPicker) {
         AppPickerDialog(
@@ -483,6 +486,7 @@ private fun ForegroundAppFields(packages: Set<String>, onChange: (Set<String>) -
         packages = packages,
         buttonText = "选择 App",
         onOpen = { showPicker = true },
+        onRemove = { pkg -> onChange(packages - pkg) },
     )
     if (!granted) {
         Spacer(Modifier.height(4.dp))
@@ -510,10 +514,20 @@ private fun ForegroundAppFields(packages: Set<String>, onChange: (Set<String>) -
     }
 }
 
-/** 「选择 App」按钮 + 已选应用名（两处复用）。 */
+/**
+ * 「选择 App」按钮 + 已选应用名（两处复用）。
+ *
+ * V12：已选 App 用 [InputChip] 展示，点 chip 本体即删除（[onRemove]），
+ * 「选择 App」按钮仍是增选入口。
+ */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun AppPickRow(packages: Set<String>, buttonText: String, onOpen: () -> Unit) {
+private fun AppPickRow(
+    packages: Set<String>,
+    buttonText: String,
+    onOpen: () -> Unit,
+    onRemove: (String) -> Unit,
+) {
     val context = LocalContext.current
     OutlinedButton(onClick = onOpen) { Text(buttonText) }
     if (packages.isEmpty()) {
@@ -529,10 +543,17 @@ private fun AppPickRow(packages: Set<String>, buttonText: String, onOpen: () -> 
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             packages.forEach { pkg ->
-                FilterChip(
+                InputChip(
                     selected = true,
-                    onClick = onOpen,
+                    onClick = { onRemove(pkg) },
                     label = { Text(AppUtils.appNameOf(context, pkg)) },
+                    trailingIcon = {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = "移除该应用",
+                            modifier = Modifier.size(16.dp),
+                        )
+                    },
                 )
             }
         }
@@ -612,38 +633,39 @@ private fun RulePickerDialog(
     )
 }
 
-// ==================== 目标规则单选对话框（V12） ====================
+// ==================== 目标规则多选对话框（V12） ====================
 
 /**
- * 目标规则**单选**对话框（V12：条件满足时作用于哪条规则的悬浮窗）。
+ * 目标规则**多选**对话框（V12：条件满足时作用于哪些规则的悬浮窗）。
  *
- * 第一项「当前规则的悬浮窗（默认）」→ [onConfirm] 传 null；其余只列**已配置悬浮动作**的
- * 规则（没有悬浮样式的规则被指向也没有窗口可作用，与 TriggerIndex.targets 同口径）。
- * 排除自身已由 ViewModel 的 `loadSelectableRules` 完成。
+ * 首项「当前规则的悬浮窗（默认）」是特殊项：勾选它 = 清空其它勾选
+ * （语义 = 只作用于本条规则自己）；未勾选时正常多选其它规则。
+ * 其余只列**已配置悬浮动作**的规则（没有悬浮样式的规则被指向也没有窗口可作用，
+ * 与 TriggerIndex.targets 同口径）。排除自身已由 ViewModel 的 `loadSelectableRules` 完成。
  *
  * @param rules 可选规则（ViewModel 已排除自身）
  * @param loading 数据源加载中
- * @param initialId 当前选中的目标规则 id（null = 当前规则）
+ * @param initialSelected 当前已选中的目标规则 id 集合（空 = 当前规则）
  */
 @Composable
 private fun TargetRulePickerDialog(
     rules: List<Rule>,
     loading: Boolean,
-    initialId: Long?,
+    initialSelected: Set<Long>,
     onDismiss: () -> Unit,
-    onConfirm: (Long?) -> Unit,
+    onConfirm: (Set<Long>) -> Unit,
 ) {
-    var selected by remember { mutableStateOf(initialId) }
+    var selected by remember { mutableStateOf(initialSelected) }
     val candidates = rules.filter { it.actions.float != null }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("选择作用于哪条规则的悬浮窗") },
+        title = { Text("选择目标规则（可多选）") },
         text = {
             Column(modifier = Modifier.heightIn(max = 400.dp)) {
                 Text(
-                    text = "不同规则的悬浮窗可同时在屏幕上显示，互不顶掉；" +
-                        "选其他规则时，用它自己的样式与内容显示 / 消失。",
+                    text = "勾选『当前规则』= 只作用于本条规则自己的悬浮窗；" +
+                        "多选 = 同时作用于多条规则的悬浮窗。",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -667,9 +689,14 @@ private fun TargetRulePickerDialog(
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                RadioButton(
-                                    selected = selected == null,
-                                    onClick = { selected = null },
+                                Checkbox(
+                                    // 特殊项：仅当未勾选任何其它规则时呈勾选态
+                                    checked = selected.isEmpty(),
+                                    onCheckedChange = { checked ->
+                                        // 勾选 = 清空其它勾选（只作用于本条规则自己）；
+                                        // 取消勾选无意义（空集合即当前规则），不做处理
+                                        if (checked) selected = emptySet()
+                                    },
                                 )
                                 Text(
                                     text = "当前规则的悬浮窗（默认）",
@@ -684,9 +711,12 @@ private fun TargetRulePickerDialog(
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                RadioButton(
-                                    selected = selected == rule.id,
-                                    onClick = { selected = rule.id },
+                                Checkbox(
+                                    checked = rule.id in selected,
+                                    onCheckedChange = { checked ->
+                                        selected = if (checked) selected + rule.id
+                                        else selected - rule.id
+                                    },
                                 )
                                 Text(
                                     text = rule.name.ifBlank { "规则 ${rule.id}" },
@@ -700,7 +730,9 @@ private fun TargetRulePickerDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = { onConfirm(selected) }) { Text("确定") }
+            TextButton(onClick = { onConfirm(selected) }) {
+                Text(if (selected.isEmpty()) "确定" else "确定（${selected.size}）")
+            }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("取消") }
