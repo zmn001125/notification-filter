@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.local.notificationfilter.NfApplication
 import com.local.notificationfilter.core.model.Rule
+import com.local.notificationfilter.core.model.RuleGroups
 import com.local.notificationfilter.core.transfer.RuleTransfer
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -18,6 +19,10 @@ data class RuleListUiState(
     val rules: List<Rule> = emptyList(),
     val blacklistCount: Int = 0,
     val hitCounts: Map<Long, Int> = emptyMap(),
+    /** V13.0：当前选中的分组；null = 全部（不过滤）。 */
+    val selectedGroup: String? = null,
+    /** V13.0：全部出现过的分组名（已排序），供顶部 tab 渲染。 */
+    val allGroups: List<String> = emptyList(),
     /** 一次性提示（导入导出结果等）；UI 用 Snackbar 展示后调 [RuleListViewModel.consumeHint] 清空。 */
     val hint: String? = null,
 )
@@ -44,7 +49,11 @@ class RuleListViewModel(application: Application) : AndroidViewModel(application
     /** 一次性 Snackbar 提示（V5 需求⑦ 导入导出结果）；UI 展示后调 [consumeHint] 清空。 */
     private val hintFlow = MutableStateFlow<String?>(null)
 
-    val uiState: StateFlow<RuleListUiState> = combine(
+    /** V13.0：当前选中的分组；null = 全部。**只在「全部」态允许拖动排序**（见 [move]）。 */
+    private val selectedGroup = MutableStateFlow<String?>(null)
+
+    /** 数据库 + 内存重排 + 提示合成的「全量」状态（未做分组过滤）。 */
+    private val baseState = combine(
         ruleRepository.observeAll(),
         blacklistRepository.observeCount(),
         recordRepository.observeHitCounts(),
@@ -58,17 +67,42 @@ class RuleListViewModel(application: Application) : AndroidViewModel(application
             hitCounts = hitCounts,
             hint = hint,
         )
+    }
+
+    /** 在 [baseState] 之上叠加分组过滤与分组清单（V13.0）。 */
+    val uiState: StateFlow<RuleListUiState> = combine(baseState, selectedGroup) { base, group ->
+        val groups = RuleGroups.distinctOf(base.rules)
+        // 选中的分组被删空后自动回落到「全部」，否则会停在永不出现的 tab 上、列表空白。
+        val effective = if (group != null && group !in groups) null else group
+        base.copy(
+            rules = RuleGroups.filter(base.rules, effective),
+            allGroups = groups,
+            selectedGroup = effective,
+        )
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5_000),
         initialValue = RuleListUiState(),
     )
 
+    /** 切换分组（null = 全部）；顺带丢弃未提交的拖动重排，避免跨组写入错位顺序。 */
+    fun selectGroup(group: String?) {
+        reorderOverride.value = null
+        selectedGroup.value = group
+    }
+
     /** 当前生效顺序（拖动中取 override，否则取库内快照）。 */
     fun currentList(): List<Rule> = reorderOverride.value ?: latestRules
 
-    /** 拖动交换：仅改内存，不写库。 */
+    /**
+     * 拖动交换：仅改内存，不写库。
+     *
+     * V13.0：**分组过滤态禁止拖动**。order 是全局稠密序号（见 [commitOrder]），
+     * 在过滤后的子集里交换位置会把「不可见的规则」挤出原顺序、甚至整体错位，
+     * 所以过滤态下此调用直接丢弃（UI 侧同样不接拖动手柄）。
+     */
     fun move(from: Int, to: Int) {
+        if (selectedGroup.value != null) return
         val current = currentList()
         if (from == to || from !in current.indices || to !in current.indices) return
         val mutable = current.toMutableList()

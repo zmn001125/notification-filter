@@ -50,6 +50,11 @@ data class Rule(
     val deviceState: DeviceStateCondition = DeviceStateCondition(),
     /** 分组匹配配置（V12.2，仅 matchMode = TEXT_GROUPS 时使用；null = 未配置）。 */
     val keywordGroups: KeywordGroupsConfig? = null,
+    /**
+     * V13.0 规则所属分组（可多个，空 = 未分组）。
+     * 仅用于列表页 tab 归类过滤，**不参与任何匹配判定**；旧规则无该键 → 空列表，零迁移。
+     */
+    val groups: List<String> = emptyList(),
 ) {
     val schemaVersion: Int get() = SCHEMA_VERSION
 

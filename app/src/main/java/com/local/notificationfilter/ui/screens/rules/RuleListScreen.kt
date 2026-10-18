@@ -45,10 +45,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -280,6 +282,41 @@ fun RuleListScreen(
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
             )
 
+            // —— V13.0 分组 tab：「全部」+ 各分组；一条规则可属多个分组，所以在多个 tab 下都出现 ——
+            // 没有任何规则带分组时整行不显示，避免给不用分组的人凭空多占一行。
+            if (state.allGroups.isNotEmpty()) {
+                val tabs: List<String?> = listOf(null) + state.allGroups
+                val selectedIndex = tabs.indexOf(state.selectedGroup).coerceAtLeast(0)
+                ScrollableTabRow(
+                    selectedTabIndex = selectedIndex,
+                    edgePadding = 12.dp,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    tabs.forEachIndexed { _, group ->
+                        Tab(
+                            selected = state.selectedGroup == group,
+                            onClick = { vm.selectGroup(group) },
+                            text = {
+                                Text(
+                                    text = group ?: "全部",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    maxLines = 1,
+                                )
+                            },
+                        )
+                    }
+                }
+                // 分组视图内禁止拖动（order 是全局优先级，过滤态交换会打乱不可见规则的顺序）
+                if (state.selectedGroup != null) {
+                    Text(
+                        text = "当前为分组视图，排序是全局优先级，请切回「全部」再拖动调整",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+                    )
+                }
+            }
+
             val rulesCount = state.rules.size
             // V9 性能：列表模型只在「规则内容 / 黑名单数量」变化时重建。
             // 原来这段 `buildList{}` 写在组合体里，任何一次与本列表无关的重组
@@ -444,6 +481,12 @@ private fun RuleCard(
                 }
             }
 
+            // —— V13.0 所属分组（可多个）——
+            if (rule.groups.isNotEmpty()) {
+                Spacer(Modifier.height(4.dp))
+                GroupTagsOf(rule)
+            }
+
             Spacer(Modifier.height(6.dp))
 
             // —— 关键词行（V3-2 结构化）——
@@ -551,6 +594,27 @@ private fun ActionTagsOf(rule: Rule) {
         rule.actions.plannedActions().forEach { action ->
             ActionTag(action = action)
             Spacer(Modifier.size(2.dp))
+        }
+    }
+}
+
+/** V13.0 规则所属分组标签：一条规则可属多组，这里全部列出来。 */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun GroupTagsOf(rule: Rule) {
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        rule.groups.forEach { group ->
+            Surface(
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(10.dp),
+                color = MaterialTheme.colorScheme.secondaryContainer,
+            ) {
+                Text(
+                    text = group,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                )
+            }
         }
     }
 }

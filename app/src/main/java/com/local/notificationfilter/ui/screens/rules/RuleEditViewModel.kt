@@ -31,6 +31,7 @@ import com.local.notificationfilter.core.model.OverlayTriggerConfig
 import com.local.notificationfilter.core.model.OverlayTriggerKind
 import com.local.notificationfilter.core.model.Placeholders
 import com.local.notificationfilter.core.model.RegexConfig
+import com.local.notificationfilter.core.model.RuleGroups
 import com.local.notificationfilter.core.model.ReplaceConfig
 import com.local.notificationfilter.core.model.RewriteMode
 import com.local.notificationfilter.core.model.Rule
@@ -185,6 +186,12 @@ data class RuleEditUiState(
     val excludeKeywords: List<String> = listOf(""),
     /** 分组匹配关键词组（V12.2，仅 TEXT_GROUPS 可见；组间 AND、组内按各组 mode 判定）。 */
     val keywordGroups: List<KeywordGroup> = listOf(KeywordGroup()),
+    /** V13.0 本规则所属分组（可多个；空 = 未分组）。注意与 [keywordGroups]（匹配用）无关。 */
+    val ruleGroups: List<String> = emptyList(),
+    /** V13.0 库里已存在的分组名（供快速加入，避免重复手打）。 */
+    val knownGroups: List<String> = emptyList(),
+    /** V13.0 新建分组输入框的草稿。 */
+    val groupDraft: String = "",
     /** 正则输入（仅 REGEX 模式）。 */
     val regexPattern: String = "",
     /** true = 不区分大小写（默认）。 */
@@ -334,8 +341,9 @@ class RuleEditViewModel(application: Application) : AndroidViewModel(application
     fun load(ruleId: Long, prefillPkg: String? = null) {
         if (_uiState.value.loaded) return
         viewModelScope.launch {
+            val allRules = ruleRepository.getAll()
             val rule = if (ruleId > 0L) {
-                ruleRepository.getAll().firstOrNull { it.id == ruleId }
+                allRules.firstOrNull { it.id == ruleId }
             } else {
                 null
             }
@@ -354,6 +362,8 @@ class RuleEditViewModel(application: Application) : AndroidViewModel(application
             } else {
                 rule.toFormState()
             }
+            // V13.0：分组候选来自库里已出现的分组名（getAll 走内存缓存，成本可忽略）
+            _uiState.update { it.copy(knownGroups = RuleGroups.distinctOf(allRules)) }
             // V9.4：应用名（含「重名补包名」）一律交给 IO 线程异步解析，
             // 此处不再同步查 PackageManager —— 否则首帧就被全量包枚举顶住。
             refreshScopeLabels()
@@ -497,6 +507,24 @@ class RuleEditViewModel(application: Application) : AndroidViewModel(application
                 }
             },
         )
+    }
+
+    // —— 所属分组（V13.0，归类用，不参与匹配）——
+
+    /** 新建分组输入框草稿。 */
+    fun setGroupDraft(text: String) = _uiState.update {
+        it.copy(groupDraft = text.take(RuleGroups.MAX_NAME_LENGTH))
+    }
+
+    /** 加入一个分组（去空白、去重；已存在则忽略）。 */
+    fun addRuleGroup(name: String) = _uiState.update { s ->
+        val normalized = RuleGroups.normalize(s.ruleGroups + name)
+        if (normalized == s.ruleGroups) s else s.copy(ruleGroups = normalized, groupDraft = "")
+    }
+
+    /** 移除一个分组。 */
+    fun removeRuleGroup(name: String) = _uiState.update { s ->
+        s.copy(ruleGroups = s.ruleGroups - name)
     }
 
     /** 设某组组内匹配方式（任一出现 / 全部出现）。 */
@@ -1087,6 +1115,8 @@ class RuleEditViewModel(application: Application) : AndroidViewModel(application
             } else {
                 null
             },
+            // V13.0 所属分组（归类用，任何模式都可设；规范化去空白/去重/去空）
+            groups = RuleGroups.normalize(s.ruleGroups),
             // V12.2：仅 TEXT_GROUPS 落库；清理空词/空组后为空则写 null（= 未配置）
             keywordGroups = if (s.matchMode == MatchMode.TEXT_GROUPS) {
                 val groups = s.keywordGroups
@@ -1336,6 +1366,8 @@ class RuleEditViewModel(application: Application) : AndroidViewModel(application
             // V12.2：旧规则（无 keywordGroups 键）回显一组空词行；空 groups 同样兜底一组
             keywordGroups = keywordGroups?.groups?.ifEmpty { listOf(KeywordGroup()) }
                 ?: listOf(KeywordGroup()),
+            // V13.0：旧规则无 groups 键 → 空列表（未分组）
+            ruleGroups = groups,
             regexPattern = regex?.pattern.orEmpty(),
             regexIgnoreCase = regex?.ignoreCase ?: true,
             scopeType = scope.type,

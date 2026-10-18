@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -94,6 +95,7 @@ import com.local.notificationfilter.core.model.MatchMode
 import com.local.notificationfilter.core.model.Placeholders
 import com.local.notificationfilter.core.model.RewriteMode
 import com.local.notificationfilter.core.model.RuleConditionDefaults
+import com.local.notificationfilter.core.model.RuleGroups
 import com.local.notificationfilter.core.model.ScopeType
 import com.local.notificationfilter.core.model.SnoozePresets
 import com.local.notificationfilter.ui.components.AppPickerDialog
@@ -453,6 +455,95 @@ fun RuleEditScreen(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
+            }
+
+            // ==================== 分组（归类标签） ====================
+            CollapsibleSection(
+                title = "分组（归类标签）",
+                summary = if (state.ruleGroups.isEmpty()) {
+                    "未分组"
+                } else {
+                    state.ruleGroups.joinToString("、")
+                },
+                titleColor = MaterialTheme.colorScheme.primary,
+            ) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "只用于规则列表顶部 tab 归类筛选，不参与任何匹配判定。一条规则可以同时属于多个分组。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+
+                if (state.ruleGroups.isEmpty()) {
+                    Text(
+                        text = "尚未加入任何分组（列表页只会显示在「全部」里）",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        state.ruleGroups.forEach { g ->
+                            InputChip(
+                                selected = true,
+                                onClick = { vm.removeRuleGroup(g) },
+                                label = { Text(g) },
+                                trailingIcon = {
+                                    Icon(
+                                        Icons.Filled.Close,
+                                        contentDescription = "移除分组 $g",
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                },
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(10.dp))
+
+                // —— 新建并加入 ——
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = state.groupDraft,
+                        onValueChange = vm::setGroupDraft,
+                        placeholder = { Text("新分组名，最多 ${RuleGroups.MAX_NAME_LENGTH} 字") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                        keyboardActions = KeyboardActions(
+                            onDone = { vm.addRuleGroup(state.groupDraft) },
+                        ),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(
+                        onClick = { vm.addRuleGroup(state.groupDraft) },
+                        enabled = state.groupDraft.isNotBlank(),
+                    ) { Text("加入") }
+                }
+
+                // —— 已有分组一键加入 ——
+                val suggestions = state.knownGroups.filter { it !in state.ruleGroups }
+                if (suggestions.isNotEmpty()) {
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        text = "已有分组（点一下加入）",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        suggestions.forEach { g ->
+                            AssistChip(onClick = { vm.addRuleGroup(g) }, label = { Text(g) })
+                        }
+                    }
+                }
             }
 
             // ==================== ② 匹配条件 ====================

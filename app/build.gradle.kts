@@ -54,8 +54,8 @@ android {
         // 3) 本 App 为自用侧载，不受应用商店 targetSdk 门槛约束；
         // 4) 避免额外下载 android-35 平台。
         targetSdk = 34
-        versionCode = 21
-        versionName = "12.2"
+        versionCode = 22
+        versionName = "13.0"
     }
 
     signingConfigs {
