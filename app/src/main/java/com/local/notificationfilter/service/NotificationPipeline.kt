@@ -78,28 +78,14 @@ class NotificationPipeline(
 
 
     /**
-     * V10.7 耗电修复：同 key **最近一次真正进入管线**的时刻（ms）。
-     *
-     * 与 [recentFingerprints] 分工不同：指纹管"内容有没有变"，这里管"变得太频繁就先不处理"。
-     * 指纹在 V10.2 把 `progress` 纳入后，音乐/下载类通知每秒都算"内容变了"，
-     * 去重形同失效 → 每秒一次完整链路（3 事务 / 7 SQL + 匹配 + 可能新建弹幕窗口）。
-     */
-    private val recentHandledAt = object : LinkedHashMap<String, Long>(64, 0.75f, true) {
-        override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<String, Long>?,
-        ): Boolean = size > 128
-    }
-
-    /**
      * V10.11 刷屏修复：**「这个 key 当前占着哪一行流水」** —— key → (recordId, 最后写入时刻)。
      *
      * 为什么还需要它（指纹 + 节流都挡不住刷屏）：
      * - [recentFingerprints] 只在**内容完全没变**时才跳过。下载 / 备份 / 音乐 / 导航这类通知的
      *   进度就在变，于是每一条更新都被判为「内容变了」→ 每一条都走完整链路 → 每一条都
      *   `insertRecord()` 插新行。指纹去重的语义是「同一次投递去重」，不是「同一条通知合并」。
-     * - [recentHandledAt] 的 [MIN_HANDLE_INTERVAL_MS] 只是把频率从「1 秒 1 行」压到
-     *   「1.2 秒 1 行」。一个跑 1 小时的下载 = 3000 行，`RecordRepository.KEEP` 才 1000 条 →
-     *   **一条通知就能把整个流水表（和记录页最近 100 条）刷满**，用户看到的就是"刷屏"。
+     * - （V11.5 起已删除 1.2 秒节流：它会把「窗口内只来一次」的内容更新永久丢掉、
+     *   也让规则拿不到新内容；真正防刷屏靠的是这里的「一条通知只占一行」。）
      *
      * 真正正确的语义是：**一条存活通知在流水里只占一行，内容随更新刷新**。
      * 于是这里记住「key → 行号」，后续更新直接 `updateSnapshot()` 改写那一行。
@@ -369,28 +355,14 @@ class NotificationPipeline(
         }
         recentFingerprints[snapshot.key] = fingerprint
 
-        // —— V10.7 耗电修复：高频更新的「同 key 时间窗节流」——
-        // 指纹口径（V11.4 起）含 subText / summaryText / **全部 extras**，
-        // 于是音乐、下载、导航这类每秒刷新的通知每次都算「内容变了」，
-        // 若不加限制就是每秒跑一遍完整链路（规则匹配 + 动作 + 若干次 SQL）。
-        // 这里加一层时间窗：同 key 在 [MIN_HANDLE_INTERVAL_MS] 内只跑一次完整链路。
-        val lastHandled = recentHandledAt[snapshot.key]
-        if (lastHandled != null && now - lastHandled < MIN_HANDLE_INTERVAL_MS) {
-            // —— V11.4：节流只压「跑规则 + 执行动作」，**绝不能把内容更新也丢掉** ——
-            // 旧实现这里直接 return。后果：如果一条通知只更新一次（例如取件通知从
-            // 「待取件」变成「已签收」），而这次更新正好落在上一次处理的 1.2 秒窗口内，
-            // 它就永久消失了 —— 流水与详情页一直显示旧内容，用户看到的就是
-            // 「通知还在、字段明明变了、但一直获取不到新内容」。
-            // 现在改为就地刷新该行内容：不跑规则、不计统计、不触发「出现」边沿，
-            // 动作频率仍被 1.2 秒窗口限制，刷屏问题不受影响。
-            if (refreshLiveRecordContent(snapshot, appName, now)) {
-                NfLog.d(this, "同 key 高频更新：仅刷新内容不跑规则 key=${snapshot.key} pkg=$packageName")
-                return@withLock
-            }
-            // 没有可刷新的「活行」（典型：刚被 onRemoved 摘掉又立刻重投，或超出合并窗口）：
-            // 不能吞掉这条通知，继续走完整链路去补一行。
-        }
-        recentHandledAt[snapshot.key] = now
+        // —— V11.5：删掉了「同 key 1.2 秒时间窗节流」——
+        // 它会把落在窗口内的第二次更新整条丢弃，后果有两个：
+        // 1. 只更新一次的通知（如「待取件」→「已签收」）内容永久丢失；
+        // 2. **规则 / 动作拿不到新内容** —— 用户明确要求「内容每次变化都要按新内容重新判定」。
+        // 现在只要指纹判定「内容变了」就完整跑一遍：匹配 + 聚合录制 + 动作 + 流水。
+        // 防刷屏改由两道已有机制保证：
+        // · 指纹去重：内容**完全相同**的重复投递照样跳过；
+        // · [upsertRecord]：一条存活通知在流水里只占一行，不会每秒新增行。
 
         // —— V7 需求 7：通知「出现」边沿 ——
         // 位置刻意放在指纹去重**之后**：进度类通知的重复刷新（内容未变）不是"新的出现"，
@@ -673,31 +645,6 @@ class NotificationPipeline(
     private class RecordSlot(val recordId: Long, val coalesced: Boolean)
 
     /**
-     * V11.4：**只刷新流水内容列**（不跑规则 / 不计统计 / 不触发「出现」边沿）。
-     *
-     * 使用场景：同一 key 的高频更新被 [MIN_HANDLE_INTERVAL_MS] 节流时。
-     * 指纹已经判定「内容确实变了」，但为了不刷屏、不狂跑动作，只把最新的
-     * 文本 / extras 写回那一行；`result` / `executedActions` / `ruleName` 故意不动——
-     * 它们描述的是「这条通知被怎么处理」，不该因为内容刷新而丢失。
-     *
-     * @return true = 已就地刷新；false = 没有可刷新的活行（调用方必须继续走完整链路，
-     *   否则「刚被 onRemoved 摘掉又立刻重投」的通知会被静默吞掉）
-     */
-    private suspend fun refreshLiveRecordContent(
-        snapshot: NotificationSnapshot,
-        appName: String,
-        now: Long,
-    ): Boolean {
-        val live = liveRecords[snapshot.key] ?: return false
-        // 超出合并窗口（10 分钟）说明这已经是「另一条通知」了，交给正常链路插新行，
-        // 这里不能硬改旧行（否则会把十分钟前的记录改成本条内容）。
-        if (!RecordCoalescer.shouldCoalesce(live.lastWriteAt, now)) return false
-        container.recordRepository.updateSnapshot(live.recordId, snapshot, appName, now)
-        live.lastWriteAt = now
-        return true
-    }
-
-    /**
      * 插一条流水（`result = PASS` 占位，判定后由 [persistEvaluation] 改写）。
      *
      * 抽出来是为了让补处理在「这条通知在服务断开期间漏记」时也能补一条，
@@ -911,19 +858,6 @@ private val BYTE_ARRAY_SIGNATURE = Regex("^\\[B@[0-9A-Fa-f]+ \\(byte\\[(\\d+)]\\
 
 private fun stableExtraValue(value: String): String =
     BYTE_ARRAY_SIGNATURE.matchEntire(value)?.let { "[byte[" + it.groupValues[1] + "]]" } ?: value
-
-/**
- * V10.7 耗电修复：同一 key 的最短处理间隔（ms）。
- *
- * 背景：指纹在 V10.2 纳入了 `subText / summaryText / android.progress`，
- * 于是音乐、下载、导航这类每秒刷新的通知**每次都算"内容变了"**，指纹去重完全失效，
- * 每秒都会跑一遍完整链路（`findByKey` + `insert+trim` + 黑名单查询 + 规则匹配 +
- * `updateResult` + 统计 3 条 SQL，命中弹幕/悬浮时还要新建窗口）。
- *
- * 1.2 秒这个值的取舍：足够把每秒更新合并掉，又不至于让人察觉进度"卡"。
- * 只作用于**同一 key 的高频更新**，正常通知（不同 key / 低频）完全不受影响。
- */
-private const val MIN_HANDLE_INTERVAL_MS = 1200L
 
 /**
  * V10.11：`key → 流水行号` 映射表的容量上限（LRU）。
