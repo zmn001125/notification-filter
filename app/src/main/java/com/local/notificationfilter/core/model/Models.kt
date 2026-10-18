@@ -22,7 +22,7 @@ val NfJson: Json = Json {
 
 /**
  * 一条过滤规则（V2 需求④）：**一个匹配模式（单选互斥）** + 模式参数（A/B 组关键词 /
- * 正则）+ 被选字段（文本 / 元信息 / extras，规则级共享）+ 作用范围 + 动作组合。
+ * 正则 / V12.2 分组匹配）+ 被选字段（文本 / 元信息 / extras，规则级共享）+ 作用范围 + 动作组合。
  */
 @Serializable
 data class Rule(
@@ -48,6 +48,8 @@ data class Rule(
     val actions: RuleActionConfig = RuleActionConfig(),
     /** V3 需求⑦：设备状态生效条件（全空 = 无限制，引擎恒通过）。 */
     val deviceState: DeviceStateCondition = DeviceStateCondition(),
+    /** 分组匹配配置（V12.2，仅 matchMode = TEXT_GROUPS 时使用；null = 未配置）。 */
+    val keywordGroups: KeywordGroupsConfig? = null,
 ) {
     val schemaVersion: Int get() = SCHEMA_VERSION
 
@@ -77,6 +79,32 @@ data class Rule(
             append(regex?.pattern.orEmpty())
             append("/")
             append(if (regex?.ignoreCase != false) "（不区分大小写）" else "（区分大小写）")
+        }
+
+        MatchMode.TEXT_GROUPS -> buildString {
+            append("分组匹配")
+            val groups = keywordGroups?.groups.orEmpty()
+            if (groups.isEmpty()) {
+                append("（未设置）")
+            } else {
+                groups.forEachIndexed { i, g ->
+                    if (i > 0) append("＋")
+                    append("第 ${i + 1} 组")
+                    val words = g.words.map { it.trim() }.filter { it.isNotEmpty() }
+                    if (words.isEmpty()) {
+                        append("（空）")
+                    } else {
+                        append(
+                            if (g.mode == GroupMatchMode.ANY) {
+                                words.joinToString("或") { "「$it」" }
+                            } else {
+                                words.joinToString("且") { "「$it」" }
+                            },
+                        )
+                    }
+                }
+            }
+            append(fieldsPart())
         }
     }
 
@@ -124,6 +152,7 @@ enum class MatchMode(val label: String, val desc: String) {
     TEXT_NOT_ALL("不包含全部", "不是所有关键词都出现，即命中"),
     TEXT_A_NOT_B("包含 A 且不包含 B", "A 组任一出现，且 B 组一个都不出现"),
     REGEX("正则表达式", "对被选字段逐字段做正则匹配"),
+    TEXT_GROUPS("分组匹配", "关键词分多组：每组都要满足，组内可设任一/全部出现"),
 }
 
 /** 通知元信息可匹配项（postTime 不做规则匹配，PRD Out of Scope）。 */
@@ -141,6 +170,29 @@ enum class MetaFieldKind(val label: String, val hint: String) {
 data class RegexConfig(
     val pattern: String = "",
     val ignoreCase: Boolean = true,
+)
+
+/** 组内匹配方式（仅 MatchMode.TEXT_GROUPS）。 */
+enum class GroupMatchMode(val label: String) {
+    ANY("任一出现"),
+    ALL("全部出现"),
+}
+
+/** 一组关键词（仅 MatchMode.TEXT_GROUPS）。 */
+@Serializable
+data class KeywordGroup(
+    val words: List<String> = emptyList(),
+    val mode: GroupMatchMode = GroupMatchMode.ANY,
+)
+
+/**
+ * 分组匹配配置（V12.2，仅 matchMode = TEXT_GROUPS 使用）。
+ * 组间 AND：每一组都必须满足；组内按 [KeywordGroup.mode] 判定。
+ * 每个关键词仍在「任一被选字段」中查找（可分别出现在不同字段，沿用 matchedFields 语义）。
+ */
+@Serializable
+data class KeywordGroupsConfig(
+    val groups: List<KeywordGroup> = emptyList(),
 )
 
 /** V1 `RuleCondition.DEFAULT_FIELDS` 的迁移落点：默认被选字段（标题 / 正文 / 消息列表）。 */

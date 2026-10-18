@@ -88,6 +88,7 @@ import com.local.notificationfilter.core.model.AggregationOutput
 import com.local.notificationfilter.core.model.OverlayPayload
 import com.local.notificationfilter.core.model.DeviceStateCondition
 import com.local.notificationfilter.core.model.FieldRef
+import com.local.notificationfilter.core.model.GroupMatchMode
 import com.local.notificationfilter.core.model.MatchField
 import com.local.notificationfilter.core.model.MatchMode
 import com.local.notificationfilter.core.model.Placeholders
@@ -120,7 +121,7 @@ import kotlin.math.roundToInt
 /**
  * P6 规则编辑（从 P5 进入）：五区表单 + 动作多选卡片（互斥置灰）+ 页内测试区。
  *
- * V2（需求④）：匹配条件 = **模式单选（七项）+ 被选字段（已选 chips + 字段选择器，
+ * V2（需求④）：匹配条件 = **模式单选（八项）+ 被选字段（已选 chips + 字段选择器，
  * 文本/元信息/extras 统一入口，需求②）+ 模式参数（A/B 组关键词 / 正则）**；
  * 关键词区随模式显隐。
  *
@@ -462,7 +463,7 @@ fun RuleEditScreen(
             ) {
                 Spacer(Modifier.height(6.dp))
 
-                // —— 模式单选（七项，互斥）——
+                // —— 模式单选（八项，互斥）——
                 ModeSelector(mode = state.matchMode, onSelect = vm::setMatchMode)
                 Spacer(Modifier.height(4.dp))
                 Text(
@@ -588,6 +589,63 @@ fun RuleEditScreen(
                         )
                         Text(
                             text = modeExplainer(state.matchMode),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+
+                    // —— V12.2 分组匹配：组间 AND、组内 ANY/ALL；每组一张卡 ——
+                    MatchMode.TEXT_GROUPS -> {
+                        state.keywordGroups.forEachIndexed { index, group ->
+                            if (index > 0) Spacer(Modifier.height(8.dp))
+                            NfCard {
+                                // 卡头行：「第 N 组」+ 组内模式二选一 +（多组时）删除该组
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = "第 ${index + 1} 组",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    FilterChip(
+                                        selected = group.mode == GroupMatchMode.ANY,
+                                        onClick = { vm.setGroupMode(index, GroupMatchMode.ANY) },
+                                        label = { Text(GroupMatchMode.ANY.label) },
+                                    )
+                                    Spacer(Modifier.size(6.dp))
+                                    FilterChip(
+                                        selected = group.mode == GroupMatchMode.ALL,
+                                        onClick = { vm.setGroupMode(index, GroupMatchMode.ALL) },
+                                        label = { Text(GroupMatchMode.ALL.label) },
+                                    )
+                                    if (state.keywordGroups.size > 1) {
+                                        IconButton(onClick = { vm.removeGroup(index) }) {
+                                            Icon(
+                                                Icons.Filled.Close,
+                                                contentDescription = "删除该组",
+                                                modifier = Modifier.size(18.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                                Spacer(Modifier.height(6.dp))
+                                KeywordEditor(
+                                    title = "组内关键词（${group.mode.label}）",
+                                    rows = group.words,
+                                    onChange = { wi, w -> vm.updateGroupWord(index, wi, w) },
+                                    onAdd = { vm.addGroupWord(index) },
+                                    onRemove = { wi -> vm.removeGroupWord(index, wi) },
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(onClick = vm::addGroup) { Text("+ 添加一组") }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = "分多组，组间全部满足才命中；组内『任一出现』或『全部出现』可选。" +
+                                "每个关键词在任一被选字段中查找（可分别在不同字段）。" +
+                                "例：第 1 组填 true，第 2 组填 salt、nest 选『任一出现』" +
+                                "= 必须出现 true 且 salt/nest 任一出现。",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -1218,7 +1276,7 @@ private fun NfSectionCard(
     }
 }
 
-/** 模式单选（七项互斥；FlowRow chips + 选中项 desc 由调用方展示）。 */
+/** 模式单选（八项互斥；FlowRow chips + 选中项 desc 由调用方展示）。 */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ModeSelector(mode: MatchMode, onSelect: (MatchMode) -> Unit) {
@@ -1390,6 +1448,8 @@ private fun modeExplainer(mode: MatchMode): String = when (mode) {
     MatchMode.TEXT_NOT_ANY -> "所有关键词都不出现才命中（关键词之间为「且」）"
     MatchMode.TEXT_NOT_ALL -> "不是所有关键词都出现，即命中（至少一个词没出现）"
     MatchMode.TEXT_A_NOT_B -> "A 组任一出现，且 B 组一个都不出现（不区分大小写）"
+    MatchMode.TEXT_GROUPS ->
+        "分多组，组间全部满足才命中；组内『任一出现』或『全部出现』可选（不区分大小写）"
     else -> ""
 }
 

@@ -2,6 +2,7 @@ package com.local.notificationfilter.core.ruleengine
 
 import com.local.notificationfilter.core.model.DeviceState
 import com.local.notificationfilter.core.model.FieldRef
+import com.local.notificationfilter.core.model.GroupMatchMode
 import com.local.notificationfilter.core.model.MatchMode
 import com.local.notificationfilter.core.model.MetaFieldKind
 import com.local.notificationfilter.core.model.NotificationSnapshot
@@ -27,6 +28,9 @@ import kotlin.text.RegexOption
  * 7. 防御性判定（UI 已拦截，引擎兜底）：文本模式关键词为空 / A_NOT_B 的 A 或 B
  *    为空 / 正则 pattern 空白 → 一律不命中并给出对应 reason；
  * 8. `enabled = false` 的规则跳过；按 `order` 升序返回**首个**命中。
+ * 9. [MatchMode.TEXT_GROUPS]（V12.2）组间 AND：每一组都必须满足；组内按
+ *    [GroupMatchMode.ANY]（任一出现）/ [GroupMatchMode.ALL]（全部出现）判定。
+ *    每个关键词仍在任一被选字段中查找（可分别出现在不同字段），命中字段为各组并集。
  */
 object RuleEngine {
 
@@ -124,6 +128,7 @@ object RuleEngine {
             MatchMode.TEXT_NOT_ALL -> matchTextNotAll(rule, base, refs, keywords, snapshot)
             MatchMode.TEXT_A_NOT_B -> matchANotB(rule, base, refs, keywords, snapshot)
             MatchMode.REGEX -> matchRegex(rule, base, refs, snapshot)
+            MatchMode.TEXT_GROUPS -> matchGroups(rule, base, refs, snapshot)
         }
     }
 
@@ -277,6 +282,44 @@ object RuleEngine {
         } else {
             base.copy(reason = "正则未命中任何被选字段：/${cfg.pattern}/$rewriteNote")
         }
+    }
+
+    // ==================== 分组匹配（V12.2 TEXT_GROUPS） ====================
+
+    /**
+     * 分组匹配：组间 AND（每一组都必须满足），组内按 [GroupMatchMode] 判定——
+     * ANY = 组内任一关键词出现；ALL = 组内每个关键词都要出现。
+     *
+     * 每个关键词仍在「任一被选字段」中查找（[matchedFields]，可分别出现在不同字段，
+     * 与 TEXT_ALL 同一口径）；命中字段取各组命中字段的并集（同一字段只记一次）。
+     *
+     * 防御性判定（UI 已拦截，引擎兜底）：未配置分组 / 分组列表为空 /
+     * 某组关键词为空 → 一律不命中，reason 定位到具体组号与缺失词。
+     */
+    private fun matchGroups(
+        rule: Rule,
+        base: MatchResult,
+        refs: List<FieldRef>,
+        snapshot: NotificationSnapshot,
+    ): MatchResult {
+        val cfg = rule.keywordGroups ?: return base.copy(reason = "未配置分组")
+        if (cfg.groups.isEmpty()) return base.copy(reason = "未配置任何分组")
+        val hitFields = linkedSetOf<FieldRef>()
+        cfg.groups.forEachIndexed { gi, group ->
+            val words = group.words.map { it.trim() }.filter { it.isNotEmpty() }
+            if (words.isEmpty()) return base.copy(reason = "第 ${gi + 1} 组未填写关键词")
+            val groupOk = when (group.mode) {
+                GroupMatchMode.ANY -> words.any { w -> matchedFields(w, refs, snapshot).isNotEmpty() }
+                GroupMatchMode.ALL -> words.all { w -> matchedFields(w, refs, snapshot).isNotEmpty() }
+            }
+            if (!groupOk) {
+                val modeWord = if (group.mode == GroupMatchMode.ANY) "任一出现" else "全部出现"
+                val missing = words.filter { w -> matchedFields(w, refs, snapshot).isEmpty() }
+                return base.copy(reason = "第 ${gi + 1} 组未满足（$modeWord）：缺 ${quoteJoin(missing)}")
+            }
+            words.forEach { w -> hitFields.addAll(matchedFields(w, refs, snapshot)) }
+        }
+        return hit(rule, base, hitFields, "命中字段：${label(hitFields)}")
     }
 
     // ==================== 原语 ====================

@@ -18,6 +18,9 @@ import com.local.notificationfilter.core.model.ExtractorConfig
 import com.local.notificationfilter.core.model.ExtrasKeys
 import com.local.notificationfilter.core.model.FieldRef
 import com.local.notificationfilter.core.model.FloatStyle
+import com.local.notificationfilter.core.model.GroupMatchMode
+import com.local.notificationfilter.core.model.KeywordGroup
+import com.local.notificationfilter.core.model.KeywordGroupsConfig
 import com.local.notificationfilter.core.model.MatchField
 import com.local.notificationfilter.core.model.MatchMode
 import com.local.notificationfilter.core.model.MetaFieldKind
@@ -165,7 +168,7 @@ data class RuleEditUiState(
     /** 当前编辑的规则 id；0 = 尚未保存（「当前汇总」区块据此显示空态）。 */
     val ruleId: Long = 0L,
     val name: String = "",
-    /** 匹配模式（单选七项；新建默认「所有内容」，PRD 默认档）。 */
+    /** 匹配模式（单选八项；新建默认「所有内容」，PRD 默认档）。 */
     val matchMode: MatchMode = MatchMode.ALL_CONTENT,
     /** 被选字段（文本 / 元信息 / extras；V2T05 起经字段选择器维护）。 */
     val selectedFields: Set<FieldRef> = RuleConditionDefaults.FIELDS
@@ -180,6 +183,8 @@ data class RuleEditUiState(
     val keywords: List<String> = listOf(""),
     /** B 组关键词（仅 TEXT_A_NOT_B 可见）。 */
     val excludeKeywords: List<String> = listOf(""),
+    /** 分组匹配关键词组（V12.2，仅 TEXT_GROUPS 可见；组间 AND、组内按各组 mode 判定）。 */
+    val keywordGroups: List<KeywordGroup> = listOf(KeywordGroup()),
     /** 正则输入（仅 REGEX 模式）。 */
     val regexPattern: String = "",
     /** true = 不区分大小写（默认）。 */
@@ -450,6 +455,69 @@ class RuleEditViewModel(application: Application) : AndroidViewModel(application
     fun removeExcludeKeyword(index: Int) = _uiState.update { s ->
         if (s.excludeKeywords.size <= 1) s
         else s.copy(excludeKeywords = s.excludeKeywords.filterIndexed { i, _ -> i != index })
+    }
+
+    // —— 分组匹配关键词组（V12.2，仅 TEXT_GROUPS）——
+
+    /** 改某组内某个下标的词。 */
+    fun updateGroupWord(groupIndex: Int, wordIndex: Int, word: String) = _uiState.update { s ->
+        if (groupIndex !in s.keywordGroups.indices) s
+        else s.copy(
+            keywordGroups = s.keywordGroups.mapIndexed { gi, g ->
+                if (gi != groupIndex) {
+                    g
+                } else if (wordIndex !in g.words.indices) {
+                    g
+                } else {
+                    g.copy(words = g.words.mapIndexed { wi, v -> if (wi == wordIndex) word else v })
+                }
+            },
+        )
+    }
+
+    /** 某组末尾追加一个空词行（提交时由 KeywordEditor 回调填充）。 */
+    fun addGroupWord(groupIndex: Int) = _uiState.update { s ->
+        if (groupIndex !in s.keywordGroups.indices) s
+        else s.copy(
+            keywordGroups = s.keywordGroups.mapIndexed { gi, g ->
+                if (gi == groupIndex) g.copy(words = g.words + "") else g
+            },
+        )
+    }
+
+    /** 删某组内某个下标的词（该组至少留 1 行，与 A/B 组关键词同一口径）。 */
+    fun removeGroupWord(groupIndex: Int, wordIndex: Int) = _uiState.update { s ->
+        if (groupIndex !in s.keywordGroups.indices) s
+        else s.copy(
+            keywordGroups = s.keywordGroups.mapIndexed { gi, g ->
+                if (gi != groupIndex || g.words.size <= 1) {
+                    g
+                } else {
+                    g.copy(words = g.words.filterIndexed { wi, _ -> wi != wordIndex })
+                }
+            },
+        )
+    }
+
+    /** 设某组组内匹配方式（任一出现 / 全部出现）。 */
+    fun setGroupMode(groupIndex: Int, mode: GroupMatchMode) = _uiState.update { s ->
+        if (groupIndex !in s.keywordGroups.indices) s
+        else s.copy(
+            keywordGroups = s.keywordGroups.mapIndexed { gi, g ->
+                if (gi == groupIndex) g.copy(mode = mode) else g
+            },
+        )
+    }
+
+    /** 追加一组（新组默认「任一出现」、一个空词行）。 */
+    fun addGroup() = _uiState.update { s ->
+        s.copy(keywordGroups = s.keywordGroups + KeywordGroup())
+    }
+
+    /** 删除整组（至少留 1 组，避免空配置无法下手）。 */
+    fun removeGroup(index: Int) = _uiState.update { s ->
+        if (s.keywordGroups.size <= 1) s
+        else s.copy(keywordGroups = s.keywordGroups.filterIndexed { i, _ -> i != index })
     }
 
     // —— 正则（仅 REGEX）——
@@ -918,6 +986,16 @@ class RuleEditViewModel(application: Application) : AndroidViewModel(application
                         )
                 }
             }
+
+            // V12.2 分组匹配：清理空词/空组后仍无有效分组 → 拦截（引擎侧同样兜底不命中）
+            MatchMode.TEXT_GROUPS -> {
+                val validGroups = s.keywordGroups
+                    .map { g -> g.copy(words = g.words.map { it.trim() }.filter { it.isNotEmpty() }) }
+                    .filter { it.words.isNotEmpty() }
+                if (validGroups.isEmpty()) {
+                    return null to "请至少填写一组关键词，且每组至少一个词"
+                }
+            }
         }
 
         // —— V7 需求 8：聚合校验（三条拦截之一/之二）——
@@ -1006,6 +1084,15 @@ class RuleEditViewModel(application: Application) : AndroidViewModel(application
             excludeKeywords = if (s.matchMode == MatchMode.TEXT_A_NOT_B) excludeKeywords else emptyList(),
             regex = if (s.matchMode == MatchMode.REGEX) {
                 RegexConfig(pattern = s.regexPattern, ignoreCase = s.regexIgnoreCase)
+            } else {
+                null
+            },
+            // V12.2：仅 TEXT_GROUPS 落库；清理空词/空组后为空则写 null（= 未配置）
+            keywordGroups = if (s.matchMode == MatchMode.TEXT_GROUPS) {
+                val groups = s.keywordGroups
+                    .map { g -> g.copy(words = g.words.map { it.trim() }.filter { it.isNotEmpty() }) }
+                    .filter { it.words.isNotEmpty() }
+                if (groups.isEmpty()) null else KeywordGroupsConfig(groups)
             } else {
                 null
             },
@@ -1246,6 +1333,9 @@ class RuleEditViewModel(application: Application) : AndroidViewModel(application
             selectedFields = fieldRefs().toSet().ifEmpty { defaultFields },
             keywords = keywords.ifEmpty { listOf("") },
             excludeKeywords = excludeKeywords.ifEmpty { listOf("") },
+            // V12.2：旧规则（无 keywordGroups 键）回显一组空词行；空 groups 同样兜底一组
+            keywordGroups = keywordGroups?.groups?.ifEmpty { listOf(KeywordGroup()) }
+                ?: listOf(KeywordGroup()),
             regexPattern = regex?.pattern.orEmpty(),
             regexIgnoreCase = regex?.ignoreCase ?: true,
             scopeType = scope.type,

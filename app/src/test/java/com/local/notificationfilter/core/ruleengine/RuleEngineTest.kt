@@ -4,9 +4,13 @@ import com.local.notificationfilter.core.model.ActionType
 import com.local.notificationfilter.core.model.DeviceState
 import com.local.notificationfilter.core.model.DeviceStateCondition
 import com.local.notificationfilter.core.model.FieldRef
+import com.local.notificationfilter.core.model.GroupMatchMode
+import com.local.notificationfilter.core.model.KeywordGroup
+import com.local.notificationfilter.core.model.KeywordGroupsConfig
 import com.local.notificationfilter.core.model.MatchField
 import com.local.notificationfilter.core.model.MatchMode
 import com.local.notificationfilter.core.model.MetaFieldKind
+import com.local.notificationfilter.core.model.NfJson
 import com.local.notificationfilter.core.model.NotificationSnapshot
 import com.local.notificationfilter.core.model.RegexConfig
 import com.local.notificationfilter.core.model.ReplaceConfig
@@ -29,7 +33,7 @@ import org.junit.Test
  * 规则引擎 JVM 单测（V2T03 验收用例集，无 Android 依赖）。
  *
  * 覆盖规格（架构 §3 / PRD 3.4）：
- * 1. 七模式语义：ALL_CONTENT 恒真；TEXT_ANY；TEXT_ALL 跨字段分布（顺丰在标题 +
+ * 1. 既有七模式语义：ALL_CONTENT 恒真；TEXT_ANY；TEXT_ALL 跨字段分布（顺丰在标题 +
  *    取件码在正文 → 命中）；TEXT_NOT_ANY 与 TEXT_NOT_ALL 的 K={A,B} 三情况对照表；
  *    TEXT_A_NOT_B（A 命中且 B 均不出现 → 命中 / B 出现一个 → 不命中 / A 未命中 → 不命中）；
  *    REGEX 逐字段。
@@ -39,6 +43,9 @@ import org.junit.Test
  * 4. 防御性：文本模式空关键词 / A_NOT_B 的 A 空或 B 空 / REGEX 空 pattern 均不命中。
  * 5. 回归：scope 三态、order 首个命中、disabled 跳过、动作计划、大小写不敏感。
  * 6. FieldRef.fromId 与旧数据兼容；Rule.summary() 新文案。
+ * 7. V12.2 分组匹配（TEXT_GROUPS）：组间 AND、组内 ANY/ALL、跨字段分布、
+ *    hitFields 并集去重、空词/空组防御性；keywordGroups JSON round-trip 与
+ *    旧规则（无该键）反序列化为 null 的零迁移兼容。
  */
 class RuleEngineTest {
 
@@ -91,6 +98,7 @@ class RuleEngineTest {
         keywords: List<String> = emptyList(),
         excludeKeywords: List<String> = emptyList(),
         regex: RegexConfig? = null,
+        keywordGroups: KeywordGroupsConfig? = null,
         scope: RuleScope = RuleScope(),
         actions: RuleActionConfig = RuleActionConfig(),
         deviceState: DeviceStateCondition = DeviceStateCondition(),
@@ -106,6 +114,7 @@ class RuleEngineTest {
         keywords = keywords,
         excludeKeywords = excludeKeywords,
         regex = regex,
+        keywordGroups = keywordGroups,
         scope = scope,
         actions = actions,
         deviceState = deviceState,
@@ -806,7 +815,7 @@ class RuleEngineTest {
     // ==================== ⑨ Rule.summary() 新文案 ====================
 
     @Test
-    fun `规则摘要_七模式文案`() {
+    fun `规则摘要_各模式文案`() {
         val f = setOf(MatchField.TITLE, MatchField.TEXT)
         assertEquals("所有内容", rule(matchMode = MatchMode.ALL_CONTENT).summary())
         assertEquals(
@@ -833,6 +842,23 @@ class RuleEngineTest {
         assertEquals(
             "正则：/(顺丰|取件码)/（不区分大小写）",
             rule(matchMode = MatchMode.REGEX, fields = f, regex = RegexConfig("(顺丰|取件码)")).summary(),
+        )
+        // V12.2：分组匹配（组1 任一 + 组2 全部）
+        assertEquals(
+            "分组匹配第 1 组「true」＋第 2 组「salt」且「nest」（标题、正文）",
+            rule(
+                matchMode = MatchMode.TEXT_GROUPS,
+                fields = f,
+                keywordGroups = KeywordGroupsConfig(
+                    groups = listOf(
+                        KeywordGroup(words = listOf("true"), mode = GroupMatchMode.ANY),
+                        KeywordGroup(
+                            words = listOf("salt", "nest"),
+                            mode = GroupMatchMode.ALL,
+                        ),
+                    ),
+                ),
+            ).summary(),
         )
     }
 
@@ -935,5 +961,177 @@ class RuleEngineTest {
         val offResult = RuleEngine.matchFirstRule(listOf(r1, r2), snap(), DeviceState(screenOn = false))
         assertNotNull(offResult)
         assertEquals("仅熄屏", offResult!!.second.ruleName)
+    }
+
+    // ==================== ⑪ V12.2 分组匹配（TEXT_GROUPS） ====================
+
+    /** 构造分组匹配规则（默认标题/正文/消息列表三字段）。 */
+    private fun groupsRule(
+        groups: List<KeywordGroup>,
+        fields: Set<MatchField> = RuleConditionDefaults.FIELDS,
+    ) = rule(
+        matchMode = MatchMode.TEXT_GROUPS,
+        fields = fields,
+        keywordGroups = KeywordGroupsConfig(groups),
+    )
+
+    @Test
+    fun `分组匹配_两组都满足_命中`() {
+        // 组1 [true]（任一）；组2 [salt, nest]（任一）——只出现 nest 即满足组2
+        val r = groupsRule(
+            listOf(
+                KeywordGroup(words = listOf("true"), mode = GroupMatchMode.ANY),
+                KeywordGroup(words = listOf("salt", "nest"), mode = GroupMatchMode.ANY),
+            ),
+        )
+        val result = RuleEngine.matchRule(r, snap(title = "true", text = "nest 已就位"))
+        assertTrue(result.hit)
+        assertTrue(result.reason.contains("命中字段"))
+    }
+
+    @Test
+    fun `分组匹配_组1缺true_不命中_原因含第1组`() {
+        val r = groupsRule(
+            listOf(
+                KeywordGroup(words = listOf("true"), mode = GroupMatchMode.ANY),
+                KeywordGroup(words = listOf("salt", "nest"), mode = GroupMatchMode.ANY),
+            ),
+        )
+        val result = RuleEngine.matchRule(r, snap(title = "false", text = "salt 与 nest"))
+        assertFalse(result.hit)
+        assertTrue(result.reason.contains("第 1 组"))
+        assertTrue(result.reason.contains("「true」"))
+    }
+
+    @Test
+    fun `分组匹配_组2缺salt和nest_不命中_原因含第2组且缺词正确`() {
+        val r = groupsRule(
+            listOf(
+                KeywordGroup(words = listOf("true"), mode = GroupMatchMode.ANY),
+                KeywordGroup(words = listOf("salt", "nest"), mode = GroupMatchMode.ANY),
+            ),
+        )
+        val result = RuleEngine.matchRule(r, snap(title = "true", text = "什么都没有"))
+        assertFalse(result.hit)
+        assertTrue(result.reason.contains("第 2 组"))
+        assertTrue(result.reason.contains("任一出现"))
+        assertTrue(result.reason.contains("「salt」"))
+        assertTrue(result.reason.contains("「nest」"))
+    }
+
+    @Test
+    fun `分组匹配_组内ALL只出现一个_不命中`() {
+        // 组2 配 ALL（全部出现），只出现 salt → 不满足
+        val r = groupsRule(
+            listOf(
+                KeywordGroup(words = listOf("true"), mode = GroupMatchMode.ANY),
+                KeywordGroup(words = listOf("salt", "nest"), mode = GroupMatchMode.ALL),
+            ),
+        )
+        val result = RuleEngine.matchRule(r, snap(title = "true", text = "salt 已就位"))
+        assertFalse(result.hit)
+        assertTrue(result.reason.contains("第 2 组"))
+        assertTrue(result.reason.contains("全部出现"))
+        assertTrue(result.reason.contains("「nest」"))
+        assertFalse(result.reason.contains("「salt」")) // salt 已出现，不算缺
+    }
+
+    @Test
+    fun `分组匹配_跨字段_true在标题_salt在正文_两字段都计入hitFields`() {
+        val r = groupsRule(
+            listOf(
+                KeywordGroup(words = listOf("true"), mode = GroupMatchMode.ANY),
+                KeywordGroup(words = listOf("salt"), mode = GroupMatchMode.ANY),
+            ),
+            fields = setOf(MatchField.TITLE, MatchField.TEXT),
+        )
+        val result = RuleEngine.matchRule(r, snap(title = "true", text = "salt 已就位"))
+        assertTrue(result.hit)
+        assertEquals(
+            setOf(FieldRef.Text(MatchField.TITLE), FieldRef.Text(MatchField.TEXT)),
+            result.hitFields,
+        )
+    }
+
+    @Test
+    fun `分组匹配_某组词全空_不命中_原因含第N组未填写`() {
+        val r = groupsRule(
+            listOf(
+                KeywordGroup(words = listOf("true"), mode = GroupMatchMode.ANY),
+                KeywordGroup(words = listOf("", "   "), mode = GroupMatchMode.ANY),
+            ),
+        )
+        val result = RuleEngine.matchRule(r, snap(title = "true", text = "salt 已就位"))
+        assertFalse(result.hit)
+        assertTrue(result.reason.contains("第 2 组未填写关键词"))
+    }
+
+    @Test
+    fun `分组匹配_groups为空_不命中_有原因`() {
+        val r = rule(matchMode = MatchMode.TEXT_GROUPS, keywordGroups = KeywordGroupsConfig())
+        val result = RuleEngine.matchRule(r, snap(title = "true", text = "salt 已就位"))
+        assertFalse(result.hit)
+        assertTrue(result.reason.contains("未配置任何分组"))
+    }
+
+    @Test
+    fun `分组匹配_未配置keywordGroups_不命中_有原因`() {
+        val r = rule(matchMode = MatchMode.TEXT_GROUPS, keywordGroups = null)
+        val result = RuleEngine.matchRule(r, snap(title = "true", text = "salt 已就位"))
+        assertFalse(result.hit)
+        assertTrue(result.reason.contains("未配置分组"))
+    }
+
+    @Test
+    fun `分组匹配_hitFields为各组命中字段并集_同字段只记一次`() {
+        // 组1 [true] 命中标题+正文；组2 [salt] 只命中正文 → 并集 {标题, 正文}（正文只一份）
+        val r = groupsRule(
+            listOf(
+                KeywordGroup(words = listOf("true"), mode = GroupMatchMode.ANY),
+                KeywordGroup(words = listOf("salt"), mode = GroupMatchMode.ANY),
+            ),
+            fields = setOf(MatchField.TITLE, MatchField.TEXT),
+        )
+        val result = RuleEngine.matchRule(
+            r,
+            snap(title = "true", text = "true 与 salt", textLines = emptyList()),
+        )
+        assertTrue(result.hit)
+        assertEquals(
+            setOf(FieldRef.Text(MatchField.TITLE), FieldRef.Text(MatchField.TEXT)),
+            result.hitFields,
+        )
+    }
+
+    @Test
+    fun `分组匹配_JSON round-trip_keywordGroups完整保留`() {
+        val r = rule(
+            matchMode = MatchMode.TEXT_GROUPS,
+            fields = setOf(MatchField.TITLE, MatchField.TEXT),
+            keywordGroups = KeywordGroupsConfig(
+                groups = listOf(
+                    KeywordGroup(words = listOf("true"), mode = GroupMatchMode.ANY),
+                    KeywordGroup(words = listOf("salt", "nest"), mode = GroupMatchMode.ALL),
+                ),
+            ),
+        )
+        val json = NfJson.encodeToString(Rule.serializer(), r)
+        val decoded = NfJson.decodeFromString<Rule>(json)
+        assertEquals(MatchMode.TEXT_GROUPS, decoded.matchMode)
+        assertEquals(r.keywordGroups, decoded.keywordGroups)
+        assertEquals(GroupMatchMode.ALL, decoded.keywordGroups!!.groups[1].mode)
+    }
+
+    @Test
+    fun `分组匹配_旧规则JSON无keywordGroups键_反序列化为null`() {
+        // V12.1 及以前导出的规则 JSON 没有该键 → 零迁移兼容
+        val oldJson =
+            """{"id":7,"name":"旧规则","enabled":true,"order":3,"matchMode":"TEXT_ANY",""" +
+                """"fields":["TITLE","TEXT","TEXTLINES"],"keywords":["顺丰"]}"""
+        val decoded = NfJson.decodeFromString<Rule>(oldJson)
+        assertEquals(MatchMode.TEXT_ANY, decoded.matchMode)
+        assertNull(decoded.keywordGroups)
+        // 旧规则行为不变：照常按 TEXT_ANY 匹配
+        assertTrue(RuleEngine.matchRule(decoded, snap(title = "顺丰速运")).hit)
     }
 }
