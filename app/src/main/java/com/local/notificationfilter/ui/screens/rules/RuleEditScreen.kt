@@ -865,13 +865,30 @@ fun RuleEditScreen(
                 // —— V10 任务 B：静音消除（「消除」的子选项，未勾选消除时不显示）——
                 if (state.block) {
                     ToggleRow(
-                        label = "静音消除（同时静音该通知所属渠道）",
+                        label = "静音",
                         checked = state.silentRemove,
                         onToggle = vm::toggleSilentRemove,
                     )
                     Text(
                         text = "Android 限制：无法只静音单条通知，会静音该渠道后续所有通知" +
                             "（渠道原始设置已留底，可恢复）",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(bottom = 4.dp),
+                    )
+                    // —— V13.2：常驻通知（「消除」的子选项，未勾选消除时不显示）——
+                    ToggleRow(
+                        label = "常驻通知",
+                        checked = state.blockOngoing,
+                        onToggle = vm::toggleBlockOngoing,
+                    )
+                    Text(
+                        text = "命中带「进行中」标记的通知（音乐、下载、导航、前台服务等）时，" +
+                            "用系统的「打盹」机制让它休眠约 1 年：期间同一条通知再更新也不会回来，" +
+                            "且不需要每次重发都删一次；到期后自动恢复，届时规则会重新判定。" +
+                            "只影响这一条通知，不影响该应用的其他常驻通知。" +
+                            "若应用改用别的通知或方式展示，可能仍压不住；系统自身的常驻通知" +
+                            "（系统更新、安全提示等）不建议消除。",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(bottom = 4.dp),

@@ -267,6 +267,21 @@ data class RuleActionConfig(
      */
     val silentRemove: Boolean = false,
 
+    /**
+     * V13.2：「也消除常驻通知」——[block] 的**子选项**（默认 false，老规则行为逐字不变）。
+     *
+     * 语义：命中带 `FLAG_ONGOING_EVENT`（进行中：音乐 / 下载 / 导航 / 前台服务等）的通知时，
+     * 除了当次消除，还把这个 key 登记进「常驻抑制表」——应用每次用相同内容重投，都在
+     * 指纹去重**之前**被再次消除。**事件驱动、零轮询**：只有应用真的重发了才动手。
+     *
+     * 为什么需要它：常驻通知由前台服务持有，`cancelNotification` 后应用会立刻重投同内容通知，
+     * 而指纹去重会把「内容未变」的重投整条丢掉 → 不登记就永远压不住。
+     *
+     * 存法：规则 JSON 单列里的普通布尔键（缺键 → 默认 false），**无需 Room 迁移**。
+     * 只在 [block] 为 true 时有意义（VM 落库时用 `s.block && s.blockOngoing` 把关）。
+     */
+    val blockOngoing: Boolean = false,
+
     /** V4 需求 7-②：弹幕显示样式（null = 未启用）。 */
     val danmaku: DanmakuStyle? = null,
     /** V4 需求 7-④：自定义位置悬浮显示样式（null = 未启用）。 */

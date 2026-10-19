@@ -218,6 +218,14 @@ data class RuleEditUiState(
      * 表单里独立保存，关掉「消除」时值仍然保留，重新勾选「消除」即恢复用户选择。
      */
     val silentRemove: Boolean = false,
+    /**
+     * V13.2：「也消除常驻通知」（[block] 的子选项）。
+     *
+     * 语义 = 命中带「进行中」标记的通知（音乐 / 下载 / 导航 / 前台服务等）时，
+     * 用系统「打盹」让它休眠约 1 年（到期自动恢复，届时规则重新判定）。
+     * 表单里独立保存，关掉「消除」时值仍然保留，重新勾选「消除」即恢复用户选择。
+     */
+    val blockOngoing: Boolean = false,
     val readAloud: Boolean = false,
     val snoozeOn: Boolean = false,
     val snoozePreset: String? = SnoozePresets.M30,
@@ -615,6 +623,7 @@ class RuleEditViewModel(application: Application) : AndroidViewModel(application
         // V10：静音消除（[RuleEditUiState.silentRemove]）在这里**刻意不动**——它是「消除」的
         // 子选项，与弹幕/悬浮样式同策略：误点一次开关不该丢掉已调好的配置；
         // 真正落库由 buildRuleFromForm 的 `s.block && s.silentRemove` 把关。
+        // V13.2：常驻通知子选项（[RuleEditUiState.blockOngoing]）同策略，也刻意不动。
         s.copy(
             block = nextBlock,
             snoozeOn = if (nextBlock) false else s.snoozeOn,
@@ -629,6 +638,14 @@ class RuleEditViewModel(application: Application) : AndroidViewModel(application
      * 编辑页不碰系统渠道（用户可能只是打开看看，没有保存就不该改系统设置）。
      */
     fun toggleSilentRemove() = _uiState.update { s -> s.copy(silentRemove = !s.silentRemove) }
+
+    /**
+     * V13.2：「也消除常驻通知」开关（只在「消除」已勾选时可见）。
+     *
+     * 只翻布尔、不做副作用——与 [toggleSilentRemove] 同策略：编辑页不碰系统，
+     * 用户可能只是打开看看，没有保存就不该有任何行为变化。
+     */
+    fun toggleBlockOngoing() = _uiState.update { s -> s.copy(blockOngoing = !s.blockOngoing) }
 
     fun toggleReadAloud() = _uiState.update { it.copy(readAloud = !it.readAloud) }
 
@@ -1131,6 +1148,8 @@ class RuleEditViewModel(application: Application) : AndroidViewModel(application
                 block = s.block,
                 // V10 任务 B：静音消除只在「消除」真正启用时才落库（否则是个无意义死字段）
                 silentRemove = s.block && s.silentRemove,
+                // V13.2：常驻通知子选项同样只在「消除」真正启用时才落库
+                blockOngoing = s.block && s.blockOngoing,
                 snooze = snooze,
                 replace = replace,
                 readAloud = s.readAloud,
@@ -1377,6 +1396,8 @@ class RuleEditViewModel(application: Application) : AndroidViewModel(application
             block = actions.block,
             // V10 任务 B：老规则（JSON 里没有该键）decode 后为 false → 开关回显「关闭」
             silentRemove = actions.silentRemove,
+            // V13.2：同上，老规则缺键 → false → 开关回显「关闭」
+            blockOngoing = actions.blockOngoing,
             readAloud = actions.readAloud,
             snoozeOn = snooze != null,
             snoozePreset = snooze?.preset ?: SnoozePresets.M30,

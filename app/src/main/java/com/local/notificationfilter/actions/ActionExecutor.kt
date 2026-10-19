@@ -45,6 +45,7 @@ private val NO_AGGREGATION_LISTS: AggregationListsSource = { _: Rule -> Aggregat
  *
  * 组合矩阵（架构 §1.3(3)）：
  * - 消除（±朗读）：cancelNotification；V10 起可叠加「静音消除」（先把来源渠道静音再取消）；
+ *   V13.2 起勾选「也消除常驻通知」且命中常驻通知时改走系统 snoozeNotification（打盹约 1 年）；
  * - 朗读（单独）：TTS，原通知不动；
  * - 推迟（单独）：系统 snoozeNotification，到点以同 key 恢复；
  * - 推迟 × 替换：立即 cancel + 自建延时重发（AlarmManager 精确到点）；
@@ -144,7 +145,16 @@ class ActionExecutor(
                         NfLog.e(this, "静音消除失败 pkg=${snapshot.packageName}: ${it.message}")
                     }
                 }
-                if (cancel(source.key)) executed.add(ActionType.BLOCK)
+                // V13.2：常驻通知改用系统「打盹」而非取消。
+                // 根因：cancelNotification 只撤掉当前这一条，前台服务几十毫秒内就用**相同内容**
+                // 重投同 key 通知 → 只能来一条删一条；而 snoozeNotification 是系统侧持久状态，
+                // 休眠期内同 key 通知不再显示，一次操作长期有效。
+                // 只对「勾了子选项 且 这条确实是常驻通知」生效，普通通知行为逐字不变。
+                if (cfg.blockOngoing && source.isOngoing()) {
+                    if (snooze(source.key, ONGOING_SNOOZE_MS)) executed.add(ActionType.BLOCK)
+                } else {
+                    if (cancel(source.key)) executed.add(ActionType.BLOCK)
+                }
             }
 
             // —— 推迟 × 替换：立即消失，到点重发改写版 ——
@@ -444,8 +454,19 @@ class ActionExecutor(
             .isSuccess
     }
 
-    private companion object {
+    companion object {
         const val DEFAULT_SNOOZE_MS = 30 * 60 * 1000L
         const val MIN_SNOOZE_MS = 60 * 1000L
+
+        /**
+         * V13.2：常驻通知被「打盹」的时长（约 1 年）。
+         *
+         * 取值依据：用户明确接受的语义——「休眠到很久以后，到期自动恢复」。
+         * 1 年在系统侧等于「持久消除」，又不至于真永久（永久无法表达，且到期后
+         * 规则会重新判定，行为可预期）。
+         *
+         * 非 private：`NotificationPipeline` 的常驻抑制表要用它判定「抑制是否到期」。
+         */
+        const val ONGOING_SNOOZE_MS = 365L * 24 * 60 * 60 * 1000L
     }
 }

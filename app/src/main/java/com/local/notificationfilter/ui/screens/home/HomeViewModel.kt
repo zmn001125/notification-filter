@@ -144,6 +144,9 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     fun toggleMaster(on: Boolean) {
         viewModelScope.launch {
             container.settingsRepository.setMasterEnabled(on)
+            // V13.2：配置变了 → 作废「常驻通知已打盹」抑制表。
+            // 否则关掉总开关再打开，之前被压着的常驻通知仍不出现（用户以为开关没生效）。
+            NfNotificationListener.instance?.clearOngoingSuppress()
             val app = getApplication<Application>()
             if (container.settingsRepository.isShowOngoing()) {
                 // 常驻通知开：文案随总开关刷新（过滤中 / 已暂停）

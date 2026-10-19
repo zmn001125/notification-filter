@@ -3,6 +3,7 @@ package com.local.notificationfilter.service
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import com.local.notificationfilter.AppContainer
+import com.local.notificationfilter.actions.ActionExecutor
 import com.local.notificationfilter.core.media.MediaSessionHolder
 import com.local.notificationfilter.core.model.ActionType
 import com.local.notificationfilter.core.model.FieldRef
@@ -111,6 +112,28 @@ class NotificationPipeline(
     }
 
     /**
+     * V13.2：「常驻通知已打盹」表 —— key → 打盹时刻（`accessOrder = true` 的 LRU，
+     * 容量 [MAX_ONGOING_SNOOZE]）。
+     *
+     * 只收录「勾选了『也消除常驻通知』且命中 BLOCK 并对常驻通知打盹成功」的 key。
+     * 存在的唯一理由：snooze 期间源 App 仍会每秒更新同 key 通知，若那时再打盹一次，
+     * **会把到期时间不断刷新**，导致永远不恢复。故抑制期内直接 return。
+     *
+     * **到期自愈**：`now - 打盹时刻 >= ActionExecutor.ONGOING_SNOOZE_MS` 时移除该项并
+     * 恢复判定（到期后通知会重新显示，规则应重新判定并可能再次打盹）。
+     *
+     * 线程安全前提与 [recentFingerprints] / [liveRecords] 完全一致：**读写**（登记 /
+     * 查询 / 移除单项）只在 [handle] / [evaluate]（mutex 内）与同一单线程 [scope] 中。
+     * 例外是三个**整表 clear** 入口（[reprocessActiveAfterRuleChange] / [clearOngoingSuppress]
+     * / [shutdown]）：由配置变更的调用线程直接执行。clear 是幂等的全表操作，与读写之间
+     * 最坏只是「刚登记即被清掉」（保守方向：少抑制一条，下条通知会重新判定），可接受。
+     */
+    private val ongoingSnoozed = object : LinkedHashMap<String, Long>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean =
+            size > MAX_ONGOING_SNOOZE
+    }
+
+    /**
      * V13.1 耗电修复：「recordId → 上次写进去的结论签名」表（同值不写）。
      *
      * 为什么需要：进度类 / 音乐类通知每秒刷新，而它命中的规则几乎永远不变 →
@@ -156,6 +179,9 @@ class NotificationPipeline(
      * @param reason 触发原因（只用于日志，便于真机排查「这次补处理是谁发起的」）
      */
     fun reprocessActiveAfterRuleChange(rule: Rule, reason: String = "规则保存") {
+        // V13.2：规则保存 = 配置可能变了（用户可能刚取消勾选「也消除常驻通知」），
+        // 旧抑制键必须作废，否则取消后通知仍会被压到打盹到期。
+        ongoingSnoozed.clear()
         // V10.3：**只带刚保存的这一条规则**。
         // 之前传的是"全部规则"，于是保存一条新规则会拿整套规则重跑通知栏，
         // 既做了用户没要求的处理，也可能把别的规则已处理过的通知重复处理一遍。
@@ -428,6 +454,10 @@ class NotificationPipeline(
             // 同 key 再投递就是一条**新通知**（微信同一个人连发两条、下载任务重开等 key 完全相同的场景），
             // 必须另起一行，否则新通知会被合并进旧行、永远沉在列表底部。
             liveRecords.remove(sbn.key)
+            // V13.2：**刻意不清除 [ongoingSnoozed]**——前台服务往往几十毫秒后就以相同内容
+            // 重投，此时系统侧的 snooze 仍然有效；清了表只会让下一次重投重新走一遍打盹，
+            // 白白刷新一次到期时间。真正的清除点是「规则保存」（[reprocessActiveAfterRuleChange]）
+            // 与「总开关切换」（[clearOngoingSuppress]），配置变了旧键必须作废。
         }
         // V7 需求 7：把「通知消失」广播给条件编排器（条件 ④ / ⑤ 的 REMOVE 边沿）。
         // 发射侧自带「无订阅者立即返回」，没有条件规则时零成本，故放在 scope 之外同步发射。
@@ -436,6 +466,7 @@ class NotificationPipeline(
     }
 
     fun shutdown() {
+        ongoingSnoozed.clear()
         scope.cancel()
     }
 
@@ -477,6 +508,22 @@ class NotificationPipeline(
                 this,
                 "通知内容为空（疑似自定义布局/RemoteViews）key=${snapshot.key} pkg=$packageName",
             )
+        }
+
+        // V13.2：常驻抑制——这个 key 已被「也消除常驻通知」打盹，且仍在抑制期内。
+        // 位置刻意在指纹去重**之前**：源 App 每秒用相同内容重投，若放在后面会被
+        // shouldSkip 整条 return；更要紧的是不能让它走到 evaluate 再打盹一次
+        // （那会把系统侧到期时间不断刷新，导致永远不恢复）。
+        if (snapshot.isOngoing) {
+            val snoozedAt = ongoingSnoozed[snapshot.key]
+            if (snoozedAt != null) {
+                if (now - snoozedAt < ActionExecutor.ONGOING_SNOOZE_MS) {
+                    NfLog.d(this, "常驻抑制中，跳过 key=${snapshot.key}")
+                    return@withLock
+                }
+                // 已到期：移除并恢复判定（到期后通知会重新显示，规则应重新判定）
+                ongoingSnoozed.remove(snapshot.key)
+            }
         }
 
         // —— 同 key 内容指纹去重（P1-6）：进度类通知的重复刷新在此丢弃 ——
@@ -685,6 +732,11 @@ class NotificationPipeline(
         // 消除类动作已让通知离开通知栏 → 指纹立即失效（与 onRemoved 双保险）：源 App 若在同一
         // 瞬间重投同内容通知，必须重新判定并再次消除，不能因「内容未变」而留在通知栏
         if (ActionType.BLOCK in executed) recentFingerprints.remove(snapshot.key)
+        // V13.2：常驻通知打盹成功 → 登记抑制（避免后续重复打盹刷新到期时间）
+        if (rule.actions.blockOngoing && snapshot.isOngoing && ActionType.BLOCK in executed) {
+            ongoingSnoozed[snapshot.key] = System.currentTimeMillis()
+            NfLog.d(this, "常驻抑制：登记 key=${snapshot.key} rule=${rule.id}")
+        }
         return Evaluation.Matched(
             rule = rule,
             hitFields = match.hitFields,
@@ -906,12 +958,29 @@ class NotificationPipeline(
         OngoingStatusNotification(appContext).show(filtering)
     }
 
+    /**
+     * V13.2：清空常驻抑制表（总开关切换时调用，配置变了旧键必须作废）。
+     *
+     * 与 [reprocessActiveAfterRuleChange] 内的 clear 分工：那一边是「保存了一条规则」，
+     * 这一边是「总开关开 / 关」——两者都意味着用户改过配置，旧的「已打盹」判定
+     * 不再代表当前意图（尤其是关闭总开关后重新开启，不应还压着旧键）。
+     */
+    fun clearOngoingSuppress() {
+        ongoingSnoozed.clear()
+    }
+
     private companion object {
         /**
          * 内容指纹表容量上限（LRU）。128 条足够覆盖「同时在通知栏里刷新的进度类通知」
          * （音乐 + 下载 + 导航 + 计时器 + 少量聊天），且内存占用可忽略（key 长度级）。
          */
         const val MAX_FINGERPRINTS = 128
+
+        /**
+         * V13.2：常驻抑制表容量上限（LRU）。只需覆盖「同时在抑制的常驻通知条数」
+         * （音乐 + 下载 + 导航 + 少量前台服务），128 足够，内存占用可忽略（key 长度级）。
+         */
+        const val MAX_ONGOING_SNOOZE = 128
 
         /**
          * 一次「规则保存后补处理」中允许补发的屏幕显示（弹幕 / 悬浮）条数上限（V10 任务 A）。

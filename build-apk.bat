@@ -34,7 +34,7 @@ set "KEYSTORE=%PROJECT_DIR%\keystore\nf-release.jks"
 set "OUTPUT_DIR=%PROJECT_DIR%\outputs"
 
 rem 产物文件名里的版本号（改版本时同步 app/build.gradle.kts 的 versionName）
-set "VERSION_TAG=v13.1"
+set "VERSION_TAG=v13.2"
 
 rem 签名口令**不写死在仓库里**：优先从 local.properties（已 gitignore）读取，
 rem 读不到就用占位默认值。Gradle 侧按同一口径读取（见 app/build.gradle.kts 顶部）。

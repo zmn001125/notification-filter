@@ -155,6 +155,17 @@ class NfNotificationListener : NotificationListenerService() {
     }
 
     /**
+     * V13.2：清空「常驻通知已打盹」抑制表。
+     *
+     * 调用点：总开关切换（`HomeViewModel.toggleMaster`）——配置变了（用户关掉总开关）
+     * 时旧键必须作废，否则关掉总开关再打开，之前被压着的常驻通知仍不出现。
+     * 管线未就绪时无需处理（表是进程内的，管线重建自然清空）。
+     */
+    fun clearOngoingSuppress() {
+        pipeline?.clearOngoingSuppress()
+    }
+
+    /**
      * 重新计算「是否需要采集媒体字段」并开关采集（V10.8）。
      *
      * 触发点：监听连接时、规则保存后。口径 = **是否有任何启用中的规则引用了 `media.*` 字段**。
